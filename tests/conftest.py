@@ -88,7 +88,7 @@ def alloc_proc() -> Generator[subprocess.Popen[bytes], None, None]:
     """Allocate 1 M ints, free every other one (~50% fill on 32-byte size class)."""
     proc = _spawn(
         "x = list(range(1_000_000)); del x[::2];"
-        " import sys; print(flush=True); sys.stdin.read()"
+        " import sys; print('x', flush=True); sys.stdin.read()"
     )
     _ready(proc)
     yield proc
