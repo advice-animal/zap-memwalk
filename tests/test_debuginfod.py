@@ -45,23 +45,23 @@ def _write_elf_with_build_id(path: Path, build_id_bytes: bytes) -> None:
 
     # ELF header (64 bytes)
     e_ident = (
-        b"\x7fELF"   # magic
-        + b"\x02"    # EI_CLASS: 64-bit
-        + b"\x01"    # EI_DATA: little-endian
-        + b"\x01"    # EI_VERSION
-        + b"\x00"    # EI_OSABI
+        b"\x7fELF"  # magic
+        + b"\x02"  # EI_CLASS: 64-bit
+        + b"\x01"  # EI_DATA: little-endian
+        + b"\x01"  # EI_VERSION
+        + b"\x00"  # EI_OSABI
         + b"\x00" * 8
     )
     # e_type=ET_DYN(3), e_machine=EM_X86_64(62), e_version=1
     elf_hdr = e_ident
-    elf_hdr += struct.pack(endian + "HHI", 3, 62, 1)   # type, machine, version
-    elf_hdr += struct.pack(endian + "Q", 0)             # e_entry
-    elf_hdr += struct.pack(endian + "Q", 0)             # e_phoff placeholder
-    elf_hdr += struct.pack(endian + "Q", 0)             # e_shoff
+    elf_hdr += struct.pack(endian + "HHI", 3, 62, 1)  # type, machine, version
+    elf_hdr += struct.pack(endian + "Q", 0)  # e_entry
+    elf_hdr += struct.pack(endian + "Q", 0)  # e_phoff placeholder
+    elf_hdr += struct.pack(endian + "Q", 0)  # e_shoff
     elf_hdr += struct.pack(endian + "IHH", 0, 64, 56)  # flags, ehsize, phentsize
     e_phoff = 0x40
-    elf_hdr += struct.pack(endian + "HH", 1, 0)        # e_phnum=1, e_shentsize
-    elf_hdr += struct.pack(endian + "HH", 0, 0)        # e_shnum, e_shstrndx
+    elf_hdr += struct.pack(endian + "HH", 1, 0)  # e_phnum=1, e_shentsize
+    elf_hdr += struct.pack(endian + "HH", 0, 0)  # e_shnum, e_shstrndx
     # patch e_phoff back in at offset 32
     elf_hdr_b = bytearray(elf_hdr)
     struct.pack_into(endian + "Q", elf_hdr_b, 32, e_phoff)
@@ -70,9 +70,14 @@ def _write_elf_with_build_id(path: Path, build_id_bytes: bytes) -> None:
     # p_type=4(PT_NOTE), p_flags=4, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align
     ph = struct.pack(
         endian + "IIQQQQQQ",
-        4, 4,
-        note_offset, 0, 0,
-        note_size, note_size, 4,
+        4,
+        4,
+        note_offset,
+        0,
+        0,
+        note_size,
+        note_size,
+        4,
     )
 
     data = bytes(elf_hdr_b) + ph + b"\x00" * (note_offset - 0x40 - len(ph)) + note
@@ -142,10 +147,8 @@ class TestRunEuAddr2line:
 
         with patch("shutil.which", return_value=str(fake_eu)):
             with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(
-                    stdout=fake_output, returncode=0
-                )
-                result = _run_eu_addr2line([0x1a2b], "/lib/foo.so")
+                mock_run.return_value = MagicMock(stdout=fake_output, returncode=0)
+                result = _run_eu_addr2line([0x1A2B], "/lib/foo.so")
         assert result == {0x1A2B: "PyFloat_Type"}
 
     def test_skips_unknown_symbol(self, tmp_path):
@@ -170,7 +173,9 @@ class TestRunEuAddr2line:
 
         with patch("shutil.which", return_value="/usr/bin/eu-addr2line"):
             with patch("subprocess.run", side_effect=fake_run):
-                _run_eu_addr2line([0x10], "/lib/foo.so", extra_env={"DEBUGINFOD_URLS": ""})
+                _run_eu_addr2line(
+                    [0x10], "/lib/foo.so", extra_env={"DEBUGINFOD_URLS": ""}
+                )
         assert captured["env"].get("DEBUGINFOD_URLS") == ""
 
 
