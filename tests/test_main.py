@@ -78,6 +78,29 @@ def test_addr_json_live_float(known_float_proc):
 
 
 @frida_mark
+def test_addr_json_live_dict(known_dict_proc):
+    """--addr-json on id(dict) finds the containing block even with PyGC_Head offset."""
+    import json
+
+    pid, addr = known_dict_proc
+    result = subprocess.run(
+        [sys.executable, "-m", "zap_memwalk", "--addr-json", str(addr), str(pid)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data is not None, "expected a block dict, got null"
+    assert data["state"] == "live"
+    assert data["type"] == "dict"
+    # The returned block address may differ from id() due to PyGC_Head pre-header;
+    # the address should be within one block_size of the reported addr.
+    block_addr = int(data["addr"], 16)
+    assert block_addr <= addr < block_addr + data["size_class"]
+
+
+@frida_mark
 def test_addr_json_not_in_pool():
     """--addr-json on a C-global type object returns an error object with a resolved symbol."""
     import json

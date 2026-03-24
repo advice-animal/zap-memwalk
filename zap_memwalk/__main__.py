@@ -130,11 +130,13 @@ def main() -> None:
                 off = args.addr_json - pool_addr
                 from zap_memwalk._model import POOL_OVERHEAD  # noqa: PLC0415
 
-                if off < POOL_OVERHEAD or (off - POOL_OVERHEAD) % block_size != 0:
+                if off < POOL_OVERHEAD:
                     print("null")
                     return
+                block_idx = (off - POOL_OVERHEAD) // block_size
+                block_addr = pool_addr + POOL_OVERHEAD + block_idx * block_size
                 blocks = _pool_blocks_json(col, found_pool, pool_raw)
-                target = f"0x{args.addr_json:x}"
+                target = f"0x{block_addr:x}"
                 match = next((b for b in blocks if b["addr"] == target), None)
                 print(json.dumps(match, indent=2))
                 return
@@ -186,9 +188,12 @@ def _pool_blocks_json(
     nextoffset = pool_raw.get("nextoffset", pool.nextoffset)
     free_set = frozenset(int(a, 16) for a in pool_raw.get("freeAddrs", []))
 
-    # First pass: collect blocks and born ob_type pointers for batch RPC.
+    # First pass: collect blocks and candidate ob_type pointers for batch RPC.
+    # GC-tracked objects (dict, list, etc.) have a 16-byte PyGC_Head before the
+    # PyObject, so ob_type lives at block+24 rather than block+8.  We collect
+    # both candidates and let resolveTypeNames tell us which is the real one.
     slots: list[dict[str, Any]] = []
-    ob_type_ptrs: list[tuple[int, int]] = []  # (addr, ob_type_ptr)
+    candidate_ptrs: set[int] = set()
     for off in range(POOL_OVERHEAD, len(raw), block_size):
         addr = pool.address + off
         blk = raw[off : off + block_size]
@@ -198,27 +203,45 @@ def _pool_blocks_json(
             state = "free"
         else:
             state = "live"
-        ob_type_ptr = struct.unpack_from("<Q", blk, 8)[0] if len(blk) >= 16 else 0
-        if state != "unborn" and ob_type_ptr:
-            ob_type_ptrs.append((addr, ob_type_ptr))
+        ptr8 = struct.unpack_from("<Q", blk, 8)[0] if len(blk) >= 16 else 0
+        ptr24 = struct.unpack_from("<Q", blk, 24)[0] if len(blk) >= 32 else 0
+        if state != "unborn":
+            if ptr8:
+                candidate_ptrs.add(ptr8)
+            if ptr24:
+                candidate_ptrs.add(ptr24)
         slots.append(
             {
                 "addr": f"0x{addr:x}",
                 "size_class": block_size,
                 "state": state,
                 "_blk": blk,
-                "_ob_type_ptr": ob_type_ptr,
+                "_ptr8": ptr8,
+                "_ptr24": ptr24,
             }
         )
 
     # Batch-resolve type names and symbols.
-    unique_ptrs = list({p for _, p in ob_type_ptrs})
+    unique_ptrs = list(candidate_ptrs)
     try:
         type_names: dict[int, str] = (
             col.resolve_type_names(unique_ptrs) if unique_ptrs else {}
         )
     except Exception:
         type_names = {}
+
+    def _pick_ob_type(ptr8: int, ptr24: int, state: str) -> int:
+        """Return the ob_type pointer that resolves to a real type name."""
+        if state == "unborn":
+            return 0
+        name8 = type_names.get(ptr8, "?") if ptr8 else "?"
+        if name8 and name8 != "?":
+            return ptr8
+        name24 = type_names.get(ptr24, "?") if ptr24 else "?"
+        if name24 and name24 != "?":
+            return ptr24
+        return ptr8  # fall back to offset-8 (shows as unknown)
+
     try:
         sym_results: dict[int, dict[str, Any] | None] = (
             col.symbolize_addresses(unique_ptrs) if unique_ptrs else {}
@@ -240,7 +263,9 @@ def _pool_blocks_json(
     result = []
     for slot in slots:
         blk = slot.pop("_blk")
-        ob_type_ptr = slot.pop("_ob_type_ptr")
+        ptr8 = slot.pop("_ptr8")
+        ptr24 = slot.pop("_ptr24")
+        ob_type_ptr = _pick_ob_type(ptr8, ptr24, slot["state"])
         slot["type"] = type_names.get(ob_type_ptr, "") if ob_type_ptr else ""
         slot["hex"] = " ".join(f"{b:02x}" for b in blk[:16])
         slot["ob_type_symbol"] = (

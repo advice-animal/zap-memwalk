@@ -5,19 +5,16 @@ from __future__ import annotations
 import os
 import struct
 import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from zap_memwalk._collector import (
     MemWalkCollector,
     _debuginfod_cache_dir,
     _elf_build_id,
     _run_eu_addr2line,
 )
-
 
 # ── _elf_build_id ─────────────────────────────────────────────────────────────
 

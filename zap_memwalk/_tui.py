@@ -837,12 +837,11 @@ class MemWalkTUI:
         full escape sequence (\x1b[B) but return only \x1b to read(1), causing
         select to time out on an empty fd and emit a spurious bare \x1b.
         """
+        import atexit
         import os
         import select as _sel
         import termios
         import tty
-
-        import atexit
 
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
