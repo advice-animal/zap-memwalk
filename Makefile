@@ -23,6 +23,7 @@ setup: .venv
 .PHONY: test
 test:
 	python -m coverage run -m pytest $(TESTOPTS)
+	python -m coverage combine
 	python -m coverage report
 
 .PHONY: format
