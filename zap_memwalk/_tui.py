@@ -106,6 +106,9 @@ class MemWalkTUI:
         self._name_hints: dict[
             int, str
         ] = {}  # block_addr -> identifying string (code/module)
+        self._ob_type_syms: dict[int, str] = {}   # ob_type_ptr -> formatted symbol string
+        self._type_ptr_cache: dict[int, str] = {}  # ob_type_ptr -> type name (RPC cache)
+        self._rpc_lookups: int = 0                  # cumulative Frida RPC lookup count
 
         # Jump-to-address input state (activated by '/')
         self._jump_buf: str | None = (
@@ -290,7 +293,11 @@ class MemWalkTUI:
         elif self._jump_err:
             second_line = f"↑↓=move  Enter=drill  b/Esc=back  /=jump  r=repr  q=quit  [{self._jump_err}]"
         else:
-            second_line = "↑↓=move  Enter=drill  b/Esc=back  /=jump  r=repr  q=quit"
+            base = "↑↓=move  Enter=drill  b/Esc=back  /=jump  r=repr  q=quit"
+            if self._rpc_lookups > 0:
+                second_line = f"{base}  [lookups: {self._rpc_lookups}]"
+            else:
+                second_line = base
         return Text.assemble(
             ("zap-memwalk", "bold"),
             "  ",
@@ -306,7 +313,7 @@ class MemWalkTUI:
         )
 
     def _make_detail_panel(self) -> Group:
-        """Fixed 5-line panel at the bottom of the block view."""
+        """Fixed 6-line panel at the bottom of the block view."""
         if self._sel_pool is None or self._pool_raw is None:
             return Group(Rule(style="dim"), Text(""))
 
@@ -371,13 +378,22 @@ class MemWalkTUI:
                 no_wrap=True,
             )
 
-        return Group(rule, content, status)
+        import struct as _struct
+        ob_type_ptr = _struct.unpack_from("<Q", blk_bytes, 8)[0] if len(blk_bytes) >= 16 else 0
+        if ob_type_ptr == 0:
+            ob_type_line = Text(f"ob_type → 0x0", style="dim", no_wrap=True)
+        elif ob_type_ptr in self._ob_type_syms:
+            ob_type_line = Text(f"ob_type → {self._ob_type_syms[ob_type_ptr]}", style="dim", no_wrap=True)
+        else:
+            ob_type_line = Text(f"ob_type → 0x{ob_type_ptr:x}", style="dim", no_wrap=True)
+
+        return Group(rule, content, status, ob_type_line)
 
     def _render(self) -> Group:
         h = shutil.get_terminal_size().lines
         if self._view == _View.BLOCK:
-            # 2 header + 2 table header/sep + 1 rule + 4 detail = 9
-            vp_h = max(1, h - 9)
+            # 2 header + 2 table header/sep + 1 rule + 5 detail = 10
+            vp_h = max(1, h - 10)
             body = self._render_block_view(vp_h)
             return Group(self._make_header(), body, self._make_detail_panel())
         else:
@@ -418,17 +434,47 @@ class MemWalkTUI:
             return
 
         unique_ptrs = list({p for _, p in pairs})
-        try:
-            resolved = self._col.resolve_type_names(unique_ptrs)
-        except Exception:
-            return
 
+        # Only call RPC for type ptrs not already in our per-pointer cache.
+        new_type_ptrs = [p for p in unique_ptrs if p not in self._type_ptr_cache]
+        if new_type_ptrs:
+            self._rpc_lookups += len(new_type_ptrs)
+            try:
+                resolved = self._col.resolve_type_names(new_type_ptrs)
+                self._type_ptr_cache.update(resolved)
+            except Exception:
+                pass
+
+        # Populate per-block-address names from the cache (handles new blocks
+        # whose type ptr was already resolved on a prior refresh).
         for addr, ob_type_ptr in pairs:
-            name = resolved.get(ob_type_ptr) or None
+            name = self._type_ptr_cache.get(ob_type_ptr) or None
             if name:
                 self._type_names[addr] = name
             elif addr not in self._type_names:
                 self._type_names[addr] = "?"
+
+        # Symbolize ob_type pointers not yet in cache.
+        unique_sym_ptrs = [p for p in unique_ptrs if p and p not in self._ob_type_syms]
+        if unique_sym_ptrs:
+            self._rpc_lookups += len(unique_sym_ptrs)
+            try:
+                sym_results = self._col.symbolize_addresses(unique_sym_ptrs)
+            except Exception:
+                sym_results = {}
+            for p, info in sym_results.items():
+                if info is None:
+                    self._ob_type_syms[p] = f"<unmapped 0x{p:x}>"
+                else:
+                    mod = info["module"]
+                    offset = info["offset"]
+                    symbol = info.get("symbol")
+                    if symbol:
+                        self._ob_type_syms[p] = f"{mod}!{symbol}"
+                    elif offset == 0:
+                        self._ob_type_syms[p] = mod
+                    else:
+                        self._ob_type_syms[p] = f"{mod}+0x{offset:x}"
 
         # For code objects, eagerly resolve co_name + co_filename via repr_block.
         # Python 3.11+ moved co_filename from +96 to +40 when the struct was reorganised.
@@ -566,6 +612,8 @@ class MemWalkTUI:
                     self._repr_lines = []
                     self._type_names = {}
                     self._name_hints = {}
+                    self._ob_type_syms = {}
+                    self._type_ptr_cache = {}
                     self._resolve_block_types()
                     self._view = _View.BLOCK
                     self._vp_start = 0
@@ -581,9 +629,15 @@ class MemWalkTUI:
                         self._cursor = 0
                     return
 
-        raise RuntimeError(
-            f"address 0x{addr:x} → pool 0x{pool_addr:x} not found in snapshot"
-        )
+        sym_label = f"0x{addr:x}"
+        try:
+            info = self._col.symbolize_addresses([addr]).get(addr)
+            if info is not None:
+                mod, offset, symbol = info["module"], info["offset"], info.get("symbol")
+                sym_label = f"{mod}!{symbol}" if symbol else (mod if offset == 0 else f"{mod}+0x{offset:x}")
+        except Exception:
+            pass
+        raise RuntimeError(f"{sym_label} not in any pymalloc pool")
 
     def _enter(self) -> None:
         if self._snap is None:
@@ -606,6 +660,8 @@ class MemWalkTUI:
                 self._repr_lines = []
                 self._type_names = {}
                 self._name_hints = {}
+                self._ob_type_syms = {}
+                self._type_ptr_cache = {}
                 self._resolve_block_types()
                 self._view = _View.BLOCK
                 self._cursor = 0
@@ -631,6 +687,8 @@ class MemWalkTUI:
             self._repr_lines = []
             self._type_names = {}
             self._name_hints = {}
+            self._ob_type_syms = {}
+            self._type_ptr_cache = {}
         elif self._view == _View.POOL:
             # Return to size-class view; restore cursor to the size class we were in.
             cursor = 0
@@ -730,7 +788,7 @@ class MemWalkTUI:
             return True
         n = self._current_list_len()
         h = shutil.get_terminal_size().lines
-        page = max(1, h - 9)
+        page = max(1, h - 10)
         if ch == "\x1b[A" or ch == "k":  # up
             self._cursor = max(0, self._cursor - 1)
         elif ch == "\x1b[B" or ch == "j":  # down

@@ -284,5 +284,39 @@ _m._mw_pymin = _sys.version_info.minor
         }
         return result;
     },
+
+    // Bulk-resolve addresses → {module, offset, symbol} or null.
+    // Uses Process.findModuleByAddress (no GIL, cross-platform) for module lookup
+    // and DebugSymbol.fromAddress (best-effort) for symbol names.
+    // NOTE: must be named symbolizeAddresses (camelCase) for Frida's Python→JS mapping.
+    symbolizeAddresses: function(addrHexList) {
+        const result = {};
+        for (const addrHex of addrHexList) {
+            try {
+                const p = ptr('0x' + addrHex);
+                // DebugSymbol.fromAddress uses dladdr() which covers __DATA segments
+                // correctly on macOS (unlike Module.size which only covers __TEXT).
+                const sym = DebugSymbol.fromAddress(p);
+                const modName = sym && sym.moduleName && sym.moduleName.length > 0
+                    ? sym.moduleName : null;
+                if (!modName) { result[addrHex] = null; continue; }
+
+                // Compute byte offset from the module's load address.
+                let offset = 0;
+                const mod = Process.findModuleByName(modName);
+                if (mod) offset = parseInt(p.sub(mod.base).toString());
+
+                // sym.name may be an address string ("0x...") when no symbol is found.
+                const rawName = sym.name || '';
+                const symbolName = (rawName.length > 0 && !rawName.startsWith('0x'))
+                    ? rawName : null;
+
+                result[addrHex] = { module: modName, offset: offset, symbol: symbolName };
+            } catch (_) {
+                result[addrHex] = null;
+            }
+        }
+        return result;
+    },
 };
 """

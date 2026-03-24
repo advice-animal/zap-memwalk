@@ -145,6 +145,15 @@ class MemWalkCollector:
         result = self._script.exports_sync.resolve_type_names(hex_list)
         return {int(k, 16): v for k, v in result.items()}
 
+    def symbolize_addresses(self, ptrs: list[int]) -> dict[int, dict[str, Any] | None]:
+        """Bulk-resolve addresses → {module, offset, symbol} or None (no GIL)."""
+        if not ptrs:
+            return {}
+        unique = list({p for p in ptrs if p})
+        hex_list = [f"{p:x}" for p in unique]
+        result = self._script.exports_sync.symbolize_addresses(hex_list)
+        return {int(k, 16): (dict(v) if v else None) for k, v in result.items()}
+
     def get_type_name(self, block_addr: int) -> str:
         """Read ob_type.tp_name for a block without GIL (best-effort)."""
         result = self._script.exports_sync.repr_block(f"{block_addr:x}")
