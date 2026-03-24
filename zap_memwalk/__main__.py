@@ -101,6 +101,10 @@ def main() -> None:
                     if found_pool:
                         break
                 if found_pool is None:
+                    # Fallback: pool may not appear in scanAllPools() (e.g. rwx range).
+                    found_pool = col.read_pool_snapshot(pool_addr)
+
+                if found_pool is None:
                     sym_label = f"0x{args.addr_json:x}"
                     try:
                         info = col.symbolize_addresses([args.addr_json]).get(
@@ -190,26 +194,20 @@ def _pool_blocks_json(
 
     # First pass: collect blocks and candidate ob_type pointers for batch RPC.
     # GC-tracked objects (dict, list, etc.) have a 16-byte PyGC_Head before the
-    # PyObject, so ob_type lives at block+24 rather than block+8.  We collect
-    # both candidates and let resolveTypeNames tell us which is the real one.
+    # PyObject, so ob_type lives at block+24 rather than block+8.  Collect both
+    # candidates and let resolveTypeNames pick the winner.
     slots: list[dict[str, Any]] = []
     candidate_ptrs: set[int] = set()
     for off in range(POOL_OVERHEAD, len(raw), block_size):
         addr = pool.address + off
         blk = raw[off : off + block_size]
-        if off >= nextoffset:
-            state = "unborn"
-        elif addr in free_set:
-            state = "free"
-        else:
-            state = "live"
+        state = (
+            "unborn" if off >= nextoffset else ("free" if addr in free_set else "live")
+        )
         ptr8 = struct.unpack_from("<Q", blk, 8)[0] if len(blk) >= 16 else 0
         ptr24 = struct.unpack_from("<Q", blk, 24)[0] if len(blk) >= 32 else 0
         if state != "unborn":
-            if ptr8:
-                candidate_ptrs.add(ptr8)
-            if ptr24:
-                candidate_ptrs.add(ptr24)
+            candidate_ptrs.update(p for p in (ptr8, ptr24) if p)
         slots.append(
             {
                 "addr": f"0x{addr:x}",
@@ -221,7 +219,7 @@ def _pool_blocks_json(
             }
         )
 
-    # Batch-resolve type names and symbols.
+    # Batch-resolve type names and symbols for all candidate ob_type pointers.
     unique_ptrs = list(candidate_ptrs)
     try:
         type_names: dict[int, str] = (
@@ -229,18 +227,6 @@ def _pool_blocks_json(
         )
     except Exception:
         type_names = {}
-
-    def _pick_ob_type(ptr8: int, ptr24: int, state: str) -> int:
-        """Return the ob_type pointer that resolves to a real type name."""
-        if state == "unborn":
-            return 0
-        name8 = type_names.get(ptr8, "?") if ptr8 else "?"
-        if name8 and name8 != "?":
-            return ptr8
-        name24 = type_names.get(ptr24, "?") if ptr24 else "?"
-        if name24 and name24 != "?":
-            return ptr24
-        return ptr8  # fall back to offset-8 (shows as unknown)
 
     try:
         sym_results: dict[int, dict[str, Any] | None] = (
@@ -265,7 +251,14 @@ def _pool_blocks_json(
         blk = slot.pop("_blk")
         ptr8 = slot.pop("_ptr8")
         ptr24 = slot.pop("_ptr24")
-        ob_type_ptr = _pick_ob_type(ptr8, ptr24, slot["state"])
+        # Pick the ob_type candidate that resolves; prefer ptr8 (non-GC types),
+        # fall back to ptr24 (GC-tracked types with PyGC_Head at block+0).
+        name8 = type_names.get(ptr8, "?") if ptr8 else "?"
+        ob_type_ptr = (
+            ptr24
+            if (name8 in ("", "?") and type_names.get(ptr24, "?") not in ("", "?"))
+            else ptr8
+        )
         slot["type"] = type_names.get(ob_type_ptr, "") if ob_type_ptr else ""
         slot["hex"] = " ".join(f"{b:02x}" for b in blk[:16])
         slot["ob_type_symbol"] = (

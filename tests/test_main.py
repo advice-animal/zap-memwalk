@@ -104,6 +104,43 @@ def test_addr_json_live_dict(known_dict_proc):
 
 
 @frida_mark
+def test_addr_json_object_id_in_pool():
+    """--addr-json on id(x) for a heap-allocated float finds the live block."""
+    import json
+
+    from tests.conftest import _ready_with_line, _spawn, _teardown
+
+    # 1.5 is not interned, so it's heap-allocated in a pymalloc pool.
+    # For non-GC objects (float), id() == PyObject* == block base address.
+    proc = _spawn("x = 1.5; import sys; print(id(x), flush=True); sys.stdin.read()")
+    addr = int(_ready_with_line(proc))
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "zap_memwalk",
+                "--addr-json",
+                str(addr),
+                str(proc.pid),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        _teardown(proc)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data is not None, "expected a block dict, got null"
+    assert "error" not in data, f"unexpected error: {data}"
+    assert data["state"] == "live"
+    # For non-GC objects, id() == block base, so addr should match exactly.
+    assert data["addr"] == f"0x{addr:x}"
+    assert data["size_class"] == 32  # float is 24 bytes → 32-byte block (szidx=1)
+
+
+@frida_mark
 def test_addr_json_not_in_pool():
     """--addr-json on a C-global type object returns an error object with a resolved symbol."""
     import json

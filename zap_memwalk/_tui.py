@@ -1,10 +1,14 @@
 """Interactive TUI for zap-memwalk using rich.Live.
 
+Two hierarchy modes (Tab to toggle):
+  size mode:  size-class → pools in that size class → blocks
+  arena mode: arena       → pools in that arena       → blocks
+
 Navigation:
-  Size-class view  ──Enter──>  Pool view  ──Enter──>  Block view
-       ^                           ^                       ^
-       └──── Escape / b ───────────┘                       │
-                   └──────────────── Escape / b ───────────┘
+  Top view  ──Enter──>  Pool view  ──Enter──>  Block view
+      ^                     ^                      ^
+      └──── Escape / b ─────┘                      │
+                  └──────────── Escape / b ─────────┘
 
 In the block view, press  r  on a selected (live) block to repr it.
 """
@@ -45,6 +49,34 @@ from zap_memwalk._model import (
 )
 
 _POOL_OVERHEAD = 48
+
+
+def _ob_type_candidates(blk: bytes) -> tuple[int, int]:
+    """Return (ptr_at_8, ptr_at_24) from raw block bytes.
+
+    ptr_at_8  is ob_type for non-GC objects (no PyGC_Head prefix).
+    ptr_at_24 is ob_type for GC-tracked objects (16-byte PyGC_Head at block+0).
+    """
+    import struct
+
+    ptr8 = struct.unpack_from("<Q", blk, 8)[0] if len(blk) >= 16 else 0
+    ptr24 = struct.unpack_from("<Q", blk, 24)[0] if len(blk) >= 32 else 0
+    return ptr8, ptr24
+
+
+def _pick_ob_type(ptr8: int, ptr24: int, cache: dict[int, str]) -> tuple[int, str]:
+    """Pick the ob_type ptr whose type name resolves (is not '' or '?').
+
+    Returns (winning_ptr, type_name).  Falls back to (ptr8, name8) when
+    neither resolves — caller gets an unresolved pointer to show as raw hex.
+    """
+    name8 = cache.get(ptr8, "?") if ptr8 else "?"
+    if name8 not in ("", "?"):
+        return ptr8, name8
+    name24 = cache.get(ptr24, "?") if ptr24 else "?"
+    if name24 not in ("", "?"):
+        return ptr24, name24
+    return ptr8, name8
 
 
 class _View(Enum):
@@ -91,12 +123,14 @@ class MemWalkTUI:
         self._snap: MemorySnapshot | None = None
         self._age = BlockAgeTracker()
 
+        self._hier_mode: str = "size"  # "size" | "arena"
         self._view = _View.SIZE_CLASS
         self._cursor = 0  # row cursor in the current view
         self._vp_start = 0  # viewport first row
 
-        # Selected size class / pool for drill-down
+        # Selected size class / pool / arena for drill-down
         self._sel_szidx: int | None = None
+        self._sel_arena_idx: int | None = None  # arena_index of selected ArenaSummary
         self._sel_pool: PoolSnapshot | None = None
 
         # Block view state
@@ -113,6 +147,14 @@ class MemWalkTUI:
             int, str
         ] = {}  # ob_type_ptr -> type name (RPC cache)
         self._rpc_lookups: int = 0  # cumulative Frida RPC lookup count
+        self._sel_pool_protection: str | None = None  # memory prot of selected pool
+
+        # Saved cursors so re-entering a previously visited level restores position.
+        # Keys: pool address (for block view), szidx or arena_index (for pool view).
+        self._saved_block_cursor: dict[int, int] = {}  # pool_addr → block cursor
+        self._saved_pool_cursor: dict[
+            tuple[str, int], int
+        ] = {}  # (mode, key) → pool cursor
 
         # Jump-to-address input state (activated by '/')
         self._jump_buf: str | None = (
@@ -161,21 +203,17 @@ class MemWalkTUI:
             )
         return t
 
-    def _render_pool_view(self, height: int) -> Table:
+    def _render_pool_list(self, pools: list[PoolSnapshot], height: int) -> Table:
+        """Shared pool-list renderer used by both size-class and arena pool views."""
         t = Table(box=box.SIMPLE_HEAD, show_edge=False)
         t.add_column("pool address", style="cyan", no_wrap=True)
+        t.add_column("sz", justify="right", style="dim", no_wrap=True)
         t.add_column("used", justify="right", no_wrap=True)
         t.add_column("total", justify="right", no_wrap=True)
         t.add_column("fill%", justify="right", no_wrap=True)
         t.add_column("fill", no_wrap=True, min_width=16)
 
-        if self._snap is None or self._sel_szidx is None:
-            return t
-
-        sc = self._snap.size_classes[self._sel_szidx]
-        pools = sc.pools
         total_rows = len(pools)
-
         self._vp_start = _clamp_viewport(
             self._vp_start, self._cursor, height, total_rows
         )
@@ -185,12 +223,67 @@ class MemWalkTUI:
             cursor_mark = "▶" if abs_i == self._cursor else " "
             t.add_row(
                 f"{cursor_mark} 0x{pool.address:016x}",
+                str(pool.block_size),
                 str(pool.ref_count),
                 str(pool.total_blocks),
                 _pct_text(pool.fill_pct),
                 _fill_bar(pool.fill_pct, 16),
             )
         return t
+
+    def _render_pool_view(self, height: int) -> Table:
+        if self._snap is None or self._sel_szidx is None:
+            return self._render_pool_list([], height)
+        return self._render_pool_list(
+            self._snap.size_classes[self._sel_szidx].pools, height
+        )
+
+    def _render_arena_view(self, height: int) -> Table:
+        t = Table(
+            box=box.SIMPLE_HEAD,
+            show_edge=False,
+            show_footer=False,
+            highlight=False,
+        )
+        t.add_column("arena", justify="right", style="cyan", no_wrap=True)
+        t.add_column("base address", style="dim", no_wrap=True)
+        t.add_column("pools", justify="right", no_wrap=True)
+        t.add_column("used", justify="right", no_wrap=True)
+        t.add_column("total", justify="right", no_wrap=True)
+        t.add_column("fill%", justify="right", no_wrap=True)
+        t.add_column("fill", no_wrap=True, min_width=16)
+
+        if self._snap is None:
+            return t
+
+        arenas = self._snap.arenas
+        total_rows = len(arenas)
+        self._vp_start = _clamp_viewport(
+            self._vp_start, self._cursor, height, total_rows
+        )
+
+        for row_i, arena in enumerate(arenas[self._vp_start : self._vp_start + height]):
+            abs_i = row_i + self._vp_start
+            cursor_mark = "▶" if abs_i == self._cursor else " "
+            t.add_row(
+                f"{cursor_mark} {arena.arena_index}",
+                f"0x{arena.base_address:016x}",
+                str(arena.pool_count),
+                f"{arena.used_blocks:,}",
+                f"{arena.total_blocks:,}",
+                _pct_text(arena.fill_pct),
+                _fill_bar(arena.fill_pct, 16),
+            )
+        return t
+
+    def _render_arena_pool_view(self, height: int) -> Table:
+        if self._snap is None or self._sel_arena_idx is None:
+            return self._render_pool_list([], height)
+        arena = next(
+            (a for a in self._snap.arenas if a.arena_index == self._sel_arena_idx),
+            None,
+        )
+        return self._render_pool_list(arena.pools if arena else [], height)
 
     def _render_block_view(self, height: int) -> Table:
         t = Table(box=box.SIMPLE_HEAD, show_edge=False)
@@ -281,23 +374,62 @@ class MemWalkTUI:
         ver_info = f"Python {snap.py_version[0]}.{snap.py_version[1]}"
         pool_info = f"{snap.pool_size // 1024}KiB pools"
 
-        view_crumb = {
-            _View.SIZE_CLASS: "size classes",
-            _View.POOL: f"size-class {self._sel_szidx} ({((self._sel_szidx or 0) + 1) * 16}B pools)",
-            _View.BLOCK: (
-                f"pool 0x{self._sel_pool.address:x}"
-                f"  sz{self._sel_pool.szidx} ({self._sel_pool.block_size}B)"
-                if self._sel_pool
-                else ""
-            ),
-        }[self._view]
+        if self._hier_mode == "arena":
+            if self._view == _View.SIZE_CLASS:
+                view_crumb = "arenas"
+            elif self._view == _View.POOL:
+                if self._sel_arena_idx is not None and snap is not None:
+                    arena = next(
+                        (
+                            a
+                            for a in snap.arenas
+                            if a.arena_index == self._sel_arena_idx
+                        ),
+                        None,
+                    )
+                    view_crumb = (
+                        f"arena {arena.arena_index}  (base 0x{arena.base_address:x})"
+                        if arena
+                        else f"arena {self._sel_arena_idx}"
+                    )
+                else:
+                    view_crumb = "arena"
+            else:  # BLOCK
+                view_crumb = (
+                    f"pool 0x{self._sel_pool.address:x}"
+                    f"  arena {self._sel_pool.arena_index}"
+                    f"  sz{self._sel_pool.szidx} ({self._sel_pool.block_size}B)"
+                    + (
+                        f"  [{self._sel_pool_protection}]"
+                        if self._sel_pool_protection
+                        else ""
+                    )
+                    if self._sel_pool
+                    else ""
+                )
+        else:
+            view_crumb = {
+                _View.SIZE_CLASS: "size classes",
+                _View.POOL: f"size-class {self._sel_szidx} ({((self._sel_szidx or 0) + 1) * 16}B pools)",
+                _View.BLOCK: (
+                    f"pool 0x{self._sel_pool.address:x}"
+                    f"  sz{self._sel_pool.szidx} ({self._sel_pool.block_size}B)"
+                    + (
+                        f"  [{self._sel_pool_protection}]"
+                        if self._sel_pool_protection
+                        else ""
+                    )
+                    if self._sel_pool
+                    else ""
+                ),
+            }[self._view]
 
         if self._jump_buf is not None:
             second_line = f"jump to address: {self._jump_buf}█  (0x… hex or decimal  Enter=go  Esc=cancel)"
         elif self._jump_err:
-            second_line = f"↑↓=move  Enter=drill  b/Esc=back  /=jump  r=repr  q=quit  [{self._jump_err}]"
+            second_line = f"↑↓=move  Enter=drill  b/Esc=back  Tab=mode  /=jump  r=repr  q=quit  [{self._jump_err}]"
         else:
-            base = "↑↓=move  Enter=drill  b/Esc=back  /=jump  r=repr  q=quit"
+            base = "↑↓=move  Enter=drill  b/Esc=back  Tab=mode  /=jump  r=repr  q=quit"
             if self._rpc_lookups > 0:
                 second_line = f"{base}  [lookups: {self._rpc_lookups}]"
             else:
@@ -382,10 +514,12 @@ class MemWalkTUI:
                 no_wrap=True,
             )
 
-        import struct as _struct
-
+        ptr8, ptr24 = _ob_type_candidates(blk_bytes)
+        # Prefer whichever candidate was resolved by _resolve_block_types.
         ob_type_ptr = (
-            _struct.unpack_from("<Q", blk_bytes, 8)[0] if len(blk_bytes) >= 16 else 0
+            ptr24
+            if (ptr24 in self._ob_type_syms and ptr8 not in self._ob_type_syms)
+            else ptr8
         )
         if ob_type_ptr == 0:
             ob_type_line = Text("ob_type → 0x0", style="dim", no_wrap=True)
@@ -413,9 +547,17 @@ class MemWalkTUI:
             # 2 header + 2 table header/sep
             vp_h = max(1, h - 4)
             if self._view == _View.SIZE_CLASS:
-                body = self._render_size_class_view(vp_h)
+                body = (
+                    self._render_arena_view(vp_h)
+                    if self._hier_mode == "arena"
+                    else self._render_size_class_view(vp_h)
+                )
             else:
-                body = self._render_pool_view(vp_h)
+                body = (
+                    self._render_arena_pool_view(vp_h)
+                    if self._hier_mode == "arena"
+                    else self._render_pool_view(vp_h)
+                )
             return Group(self._make_header(), body)
 
     def _resolve_block_types(self) -> None:
@@ -429,27 +571,25 @@ class MemWalkTUI:
         nextoffset = self._pool_raw.get("nextoffset", self._sel_pool.nextoffset)
         block_size = (szidx + 1) * 16
 
-        # Collect (block_addr, ob_type_ptr) for live AND free blocks.
-        # When a block is freed, CPython overwrites only offset 0-7 (ob_refcnt)
-        # with the free-list link; offset 8-15 (ob_type) is left as stale data.
-        pairs: list[tuple[int, int]] = []
+        # Collect candidate ob_type pointers for live AND free blocks.
+        # GC-tracked objects (dict, list, etc.) have a 16-byte PyGC_Head before
+        # the PyObject, so we read both block+8 and block+24 and let
+        # resolveTypeNames determine which is the real ob_type pointer.
+        block_cands: list[tuple[int, int, int]] = []  # (addr, ptr8, ptr24)
+        all_candidates: set[int] = set()
         for off in range(_POOL_OVERHEAD, len(raw), block_size):
             addr = self._sel_pool.address + off
             if off >= nextoffset:
                 continue  # unborn — never had a type
-            if off + 16 > len(raw):
-                continue
-            ob_type_ptr = struct.unpack_from("<Q", raw, off + 8)[0]
-            if ob_type_ptr:
-                pairs.append((addr, ob_type_ptr))
+            ptr8, ptr24 = _ob_type_candidates(raw[off : off + block_size])
+            all_candidates.update(p for p in (ptr8, ptr24) if p)
+            block_cands.append((addr, ptr8, ptr24))
 
-        if not pairs:
+        if not block_cands:
             return
 
-        unique_ptrs = list({p for _, p in pairs})
-
         # Only call RPC for type ptrs not already in our per-pointer cache.
-        new_type_ptrs = [p for p in unique_ptrs if p not in self._type_ptr_cache]
+        new_type_ptrs = [p for p in all_candidates if p not in self._type_ptr_cache]
         if new_type_ptrs:
             self._rpc_lookups += len(new_type_ptrs)
             try:
@@ -458,17 +598,19 @@ class MemWalkTUI:
             except Exception:
                 pass
 
-        # Populate per-block-address names from the cache (handles new blocks
-        # whose type ptr was already resolved on a prior refresh).
-        for addr, ob_type_ptr in pairs:
-            name = self._type_ptr_cache.get(ob_type_ptr) or None
-            if name:
+        # Populate per-block-address names, picking the candidate that resolves.
+        winning_ptrs: list[tuple[int, int]] = []  # (addr, ob_type_ptr)
+        for addr, ptr8, ptr24 in block_cands:
+            ob_type_ptr, name = _pick_ob_type(ptr8, ptr24, self._type_ptr_cache)
+            if name not in ("", "?"):
                 self._type_names[addr] = name
             elif addr not in self._type_names:
                 self._type_names[addr] = "?"
+            if ob_type_ptr:
+                winning_ptrs.append((addr, ob_type_ptr))
 
-        # Symbolize ob_type pointers not yet in cache.
-        unique_sym_ptrs = [p for p in unique_ptrs if p and p not in self._ob_type_syms]
+        # Symbolize winning ob_type pointers not yet in cache.
+        unique_sym_ptrs = [p for _, p in winning_ptrs if p not in self._ob_type_syms]
         if unique_sym_ptrs:
             self._rpc_lookups += len(unique_sym_ptrs)
             try:
@@ -497,7 +639,7 @@ class MemWalkTUI:
         else:
             co_name_off, co_filename_off = 104, 96
 
-        for addr, _ in pairs:
+        for addr, _ in winning_ptrs:
             type_n = self._type_names.get(addr)
             if addr in self._name_hints:
                 continue
@@ -531,6 +673,52 @@ class MemWalkTUI:
                                 self._name_hints[addr] = result[1]
                         except Exception:
                             pass
+
+            elif type_n == "frame":
+                # frame is GC-tracked: PyGC_Head(16) + ob_refcnt(8) + ob_type(8) = 32 bytes,
+                # then f_back(8), then f_code/f_frame at block+40.
+                #   3.10:  f_code (PyCodeObject*) at block+40
+                #   3.11+: f_frame (_PyInterpreterFrame*) at block+40;
+                #          for heap frames f_frame points into the same pool block;
+                #          f_code is at _PyInterpreterFrame+32
+                if off + 48 > len(raw):
+                    continue
+                ptr_at_40 = struct.unpack_from("<Q", raw, off + 40)[0]
+                if not ptr_at_40:
+                    continue
+                if py_ver >= (3, 11):
+                    # Follow f_frame → f_code only if f_frame lands inside this pool's raw bytes
+                    # (heap frames). Stack frames can't be followed safely.
+                    f_frame_in_raw = ptr_at_40 - self._sel_pool.address
+                    if not (0 <= f_frame_in_raw + 40 <= len(raw)):
+                        continue
+                    f_code_ptr = struct.unpack_from("<Q", raw, f_frame_in_raw + 32)[0]
+                    if not f_code_ptr:
+                        continue
+                    ptr_at_40 = f_code_ptr
+                # ptr_at_40 is now the f_code PyObject* — call repr_block to get its name.
+                try:
+                    result = self._col.repr_block(ptr_at_40)
+                    if result:
+                        import re
+
+                        m = re.search(r"<code object ([^\s>]+)", result[1])
+                        if m:
+                            self._name_hints[addr] = m.group(1)
+                except Exception:
+                    pass
+
+    def _fetch_pool_protection(self) -> None:
+        """Fetch and cache the memory protection string for the selected pool."""
+        if self._sel_pool is None:
+            self._sel_pool_protection = None
+            return
+        try:
+            self._sel_pool_protection = self._col.get_range_protection(
+                self._sel_pool.address
+            )
+        except Exception:
+            self._sel_pool_protection = None
 
     # ── snapshot refresh ──────────────────────────────────────────────────────
 
@@ -582,9 +770,25 @@ class MemWalkTUI:
         if self._snap is None:
             return 0
         if self._view == _View.SIZE_CLASS:
+            if self._hier_mode == "arena":
+                return len(self._snap.arenas)
             return sum(1 for sc in self._snap.size_classes if sc.pool_count > 0)
-        if self._view == _View.POOL and self._sel_szidx is not None:
-            return len(self._snap.size_classes[self._sel_szidx].pools)
+        if self._view == _View.POOL:
+            if self._hier_mode == "arena":
+                if self._sel_arena_idx is not None:
+                    arena = next(
+                        (
+                            a
+                            for a in self._snap.arenas
+                            if a.arena_index == self._sel_arena_idx
+                        ),
+                        None,
+                    )
+                    return len(arena.pools) if arena else 0
+                return 0
+            if self._sel_szidx is not None:
+                return len(self._snap.size_classes[self._sel_szidx].pools)
+            return 0
         if self._view == _View.BLOCK and self._sel_pool is not None:
             szidx = (
                 self._pool_raw.get("szidx", self._sel_pool.szidx)
@@ -608,39 +812,58 @@ class MemWalkTUI:
         pool_addr = addr & ~(pool_size - 1)  # mask to pool-aligned base
 
         # Find the size class and pool index
+        found_pool = None
+        found_szidx = None
+        pool_cursor = 0
         for sc in self._snap.size_classes:
             for pool_idx, pool in enumerate(sc.pools):
                 if pool.address == pool_addr:
-                    # Navigate: switch to pool view for this size class
-                    self._sel_szidx = sc.szidx
-                    self._view = _View.POOL
-                    self._cursor = pool_idx
-                    self._vp_start = 0
-                    # Immediately drill into block view
-                    self._sel_pool = pool
-                    try:
-                        self._pool_raw = self._col.read_pool(pool.address)
-                    except Exception:
-                        self._pool_raw = None
-                    self._repr_lines = []
-                    self._type_names = {}
-                    self._name_hints = {}
-                    self._ob_type_syms = {}
-                    self._type_ptr_cache = {}
-                    self._resolve_block_types()
-                    self._view = _View.BLOCK
-                    self._vp_start = 0
-                    # Position cursor on the target block
-                    block_size = (sc.szidx + 1) * 16
-                    off = addr - pool_addr
-                    if (
-                        off >= _POOL_OVERHEAD
-                        and (off - _POOL_OVERHEAD) % block_size == 0
-                    ):
-                        self._cursor = (off - _POOL_OVERHEAD) // block_size
-                    else:
-                        self._cursor = 0
-                    return
+                    found_pool = pool
+                    found_szidx = sc.szidx
+                    pool_cursor = pool_idx
+                    break
+            if found_pool:
+                break
+
+        if found_pool is None:
+            found_pool = self._col.read_pool_snapshot(pool_addr)
+            found_szidx = found_pool.szidx if found_pool else None
+            pool_cursor = 0
+
+        if found_pool is not None:
+            assert found_szidx is not None
+            # Navigate: switch to pool view for this size class / arena
+            self._sel_szidx = found_szidx
+            if self._hier_mode == "arena" and self._snap is not None:
+                for arena in self._snap.arenas:
+                    if arena.arena_index == found_pool.arena_index:
+                        self._sel_arena_idx = arena.arena_index
+                        break
+            self._view = _View.POOL
+            self._cursor = pool_cursor
+            self._vp_start = 0
+            # Immediately drill into block view
+            self._sel_pool = found_pool
+            try:
+                self._pool_raw = self._col.read_pool(found_pool.address)
+            except Exception:
+                self._pool_raw = None
+            self._repr_lines = []
+            self._type_names = {}
+            self._name_hints = {}
+            self._ob_type_syms = {}
+            self._type_ptr_cache = {}
+            self._fetch_pool_protection()
+            self._resolve_block_types()
+            self._view = _View.BLOCK
+            self._vp_start = 0
+            # Position cursor on the target block (floor-div; no strict alignment check)
+            block_size = (found_szidx + 1) * 16
+            off = addr - pool_addr
+            self._cursor = (
+                (off - _POOL_OVERHEAD) // block_size if off >= _POOL_OVERHEAD else 0
+            )
+            return
 
         sym_label = f"0x{addr:x}"
         try:
@@ -660,14 +883,53 @@ class MemWalkTUI:
         if self._snap is None:
             return
         if self._view == _View.SIZE_CLASS:
-            active = [sc for sc in self._snap.size_classes if sc.pool_count > 0]
-            if self._cursor < len(active):
-                self._sel_szidx = active[self._cursor].szidx
-                self._view = _View.POOL
-                self._cursor = 0
-                self._vp_start = 0
-        elif self._view == _View.POOL and self._sel_szidx is not None:
-            pools = self._snap.size_classes[self._sel_szidx].pools
+            if self._hier_mode == "arena":
+                arenas = self._snap.arenas
+                if self._cursor < len(arenas):
+                    arena = arenas[self._cursor]
+                    self._sel_arena_idx = arena.arena_index
+                    saved = self._saved_pool_cursor.get(
+                        ("arena", self._sel_arena_idx), None
+                    )
+                    if saved is None and self._sel_szidx is not None:
+                        # Align cursor to the first pool with the same size class
+                        # so that toggling back to size mode lands on the right row.
+                        for j, p in enumerate(arena.pools):
+                            if p.szidx == self._sel_szidx:
+                                saved = j
+                                break
+                    if saved is None:
+                        saved = 0
+                    self._view = _View.POOL
+                    self._cursor = saved
+                    self._vp_start = 0
+            else:
+                active = [sc for sc in self._snap.size_classes if sc.pool_count > 0]
+                if self._cursor < len(active):
+                    self._sel_szidx = active[self._cursor].szidx
+                    saved = self._saved_pool_cursor.get(("size", self._sel_szidx), 0)
+                    self._view = _View.POOL
+                    self._cursor = saved
+                    self._vp_start = 0
+        elif self._view == _View.POOL:
+            if self._hier_mode == "arena":
+                pools: list[PoolSnapshot] = []
+                if self._sel_arena_idx is not None:
+                    _arena = next(
+                        (
+                            a
+                            for a in self._snap.arenas
+                            if a.arena_index == self._sel_arena_idx
+                        ),
+                        None,
+                    )
+                    pools = _arena.pools if _arena else []
+            else:
+                pools = (
+                    self._snap.size_classes[self._sel_szidx].pools
+                    if self._sel_szidx is not None
+                    else []
+                )
             if self._cursor < len(pools):
                 self._sel_pool = pools[self._cursor]
                 try:
@@ -679,25 +941,40 @@ class MemWalkTUI:
                 self._name_hints = {}
                 self._ob_type_syms = {}
                 self._type_ptr_cache = {}
+                self._fetch_pool_protection()
                 self._resolve_block_types()
                 self._view = _View.BLOCK
-                self._cursor = 0
+                self._cursor = self._saved_block_cursor.get(self._sel_pool.address, 0)
                 self._vp_start = 0
 
     def _back(self) -> None:
         if self._view == _View.BLOCK:
-            # Return to pool view; restore cursor to the pool we were viewing.
+            # Save block cursor so re-entering this pool restores position.
+            if self._sel_pool is not None:
+                self._saved_block_cursor[self._sel_pool.address] = self._cursor
+            # Return to pool view; restore cursor to the pool we came from.
             cursor = 0
-            if (
-                self._snap is not None
-                and self._sel_szidx is not None
-                and self._sel_pool is not None
-            ):
-                pools = self._snap.size_classes[self._sel_szidx].pools
-                for i, p in enumerate(pools):
-                    if p.address == self._sel_pool.address:
-                        cursor = i
-                        break
+            if self._snap is not None and self._sel_pool is not None:
+                if self._hier_mode == "arena" and self._sel_arena_idx is not None:
+                    arena = next(
+                        (
+                            a
+                            for a in self._snap.arenas
+                            if a.arena_index == self._sel_arena_idx
+                        ),
+                        None,
+                    )
+                    if arena:
+                        for i, p in enumerate(arena.pools):
+                            if p.address == self._sel_pool.address:
+                                cursor = i
+                                break
+                elif self._sel_szidx is not None:
+                    pools = self._snap.size_classes[self._sel_szidx].pools
+                    for i, p in enumerate(pools):
+                        if p.address == self._sel_pool.address:
+                            cursor = i
+                            break
             self._view = _View.POOL
             self._cursor = cursor
             self._vp_start = 0
@@ -706,18 +983,113 @@ class MemWalkTUI:
             self._name_hints = {}
             self._ob_type_syms = {}
             self._type_ptr_cache = {}
+            self._sel_pool_protection = None
         elif self._view == _View.POOL:
-            # Return to size-class view; restore cursor to the size class we were in.
+            # Save pool cursor so re-entering this size class / arena restores position.
+            pool_key: tuple[str, int] | None = None
+            if self._hier_mode == "arena" and self._sel_arena_idx is not None:
+                pool_key = ("arena", self._sel_arena_idx)
+            elif self._sel_szidx is not None:
+                pool_key = ("size", self._sel_szidx)
+            if pool_key is not None:
+                self._saved_pool_cursor[pool_key] = self._cursor
+            # Return to top-level view; restore cursor to the item we came from.
             cursor = 0
-            if self._snap is not None and self._sel_szidx is not None:
-                active = [sc for sc in self._snap.size_classes if sc.pool_count > 0]
-                for i, sc in enumerate(active):
-                    if sc.szidx == self._sel_szidx:
-                        cursor = i
-                        break
+            if self._snap is not None:
+                if self._hier_mode == "arena" and self._sel_arena_idx is not None:
+                    for i, arena in enumerate(self._snap.arenas):
+                        if arena.arena_index == self._sel_arena_idx:
+                            cursor = i
+                            break
+                elif self._sel_szidx is not None:
+                    active = [sc for sc in self._snap.size_classes if sc.pool_count > 0]
+                    for i, sc in enumerate(active):
+                        if sc.szidx == self._sel_szidx:
+                            cursor = i
+                            break
             self._view = _View.SIZE_CLASS
             self._cursor = cursor
             self._vp_start = 0
+
+    def _toggle_hier_mode(self) -> None:
+        """Toggle between 'size' and 'arena' hierarchy modes, preserving selection."""
+        snap = self._snap
+        target = "arena" if self._hier_mode == "size" else "size"
+
+        if self._view == _View.SIZE_CLASS:
+            if target == "arena" and snap is not None:
+                # Find the arena containing the first pool of the highlighted size class.
+                active = [sc for sc in snap.size_classes if sc.pool_count > 0]
+                arenas = snap.arenas
+                arena_cursor = 0
+                if self._cursor < len(active) and active[self._cursor].pools:
+                    first_pool = active[self._cursor].pools[0]
+                    for i, a in enumerate(arenas):
+                        if a.arena_index == first_pool.arena_index:
+                            arena_cursor = i
+                            break
+                self._cursor = arena_cursor
+            elif target == "size" and snap is not None:
+                # Find the size class of the first pool in the highlighted arena.
+                arenas = snap.arenas
+                active = [sc for sc in snap.size_classes if sc.pool_count > 0]
+                sc_cursor = 0
+                if self._cursor < len(arenas) and arenas[self._cursor].pools:
+                    first_szidx = arenas[self._cursor].pools[0].szidx
+                    for i, sc in enumerate(active):
+                        if sc.szidx == first_szidx:
+                            sc_cursor = i
+                            break
+                self._cursor = sc_cursor
+            self._vp_start = 0
+
+        elif self._view == _View.POOL:
+            if target == "arena" and snap is not None and self._sel_szidx is not None:
+                # Find the highlighted pool and locate it in arena mode.
+                pools = snap.size_classes[self._sel_szidx].pools
+                pool = pools[self._cursor] if self._cursor < len(pools) else None
+                if pool is not None:
+                    for a in snap.arenas:
+                        if a.arena_index == pool.arena_index:
+                            self._sel_arena_idx = a.arena_index
+                            for j, ap in enumerate(a.pools):
+                                if ap.address == pool.address:
+                                    self._cursor = j
+                                    break
+                            break
+            elif (
+                target == "size"
+                and snap is not None
+                and self._sel_arena_idx is not None
+            ):
+                # Find the highlighted pool and locate it in size mode.
+                arena = next(
+                    (a for a in snap.arenas if a.arena_index == self._sel_arena_idx),
+                    None,
+                )
+                pool = None
+                if arena and arena.pools:
+                    pool_idx = min(self._cursor, len(arena.pools) - 1)
+                    pool = arena.pools[pool_idx]
+                if pool is not None:
+                    self._sel_szidx = pool.szidx
+                    size_pools = snap.size_classes[pool.szidx].pools
+                    for j, sp in enumerate(size_pools):
+                        if sp.address == pool.address:
+                            self._cursor = j
+                            break
+            self._vp_start = 0
+
+        else:  # BLOCK — just flip the flag, keeping _sel_pool and cursor unchanged.
+            if target == "arena" and snap is not None and self._sel_pool is not None:
+                for a in snap.arenas:
+                    if a.arena_index == self._sel_pool.arena_index:
+                        self._sel_arena_idx = a.arena_index
+                        break
+            elif target == "size" and self._sel_pool is not None:
+                self._sel_szidx = self._sel_pool.szidx
+
+        self._hier_mode = target
 
     def _do_repr(self) -> None:
         """Repr selected block (block view only)."""
@@ -821,6 +1193,8 @@ class MemWalkTUI:
         elif ch == "/":
             self._jump_buf = ""
             self._jump_err = ""
+        elif ch == "\t":
+            self._toggle_hier_mode()
         elif ch == "r":
             self._do_repr()
         elif ch == "R":

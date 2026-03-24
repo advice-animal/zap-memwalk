@@ -85,6 +85,34 @@ class SizeClassSummary:
 
 
 @dataclass
+class ArenaSummary:
+    """Pools grouped by their arena_index (pool_header.arenaindex field)."""
+
+    arena_index: int
+    base_address: (
+        int  # min(pool.address) for this arena — best approximation of arena base
+    )
+    pools: list[PoolSnapshot] = field(default_factory=list)
+
+    @property
+    def pool_count(self) -> int:
+        return len(self.pools)
+
+    @property
+    def used_blocks(self) -> int:
+        return sum(p.ref_count for p in self.pools)
+
+    @property
+    def total_blocks(self) -> int:
+        return sum(p.total_blocks for p in self.pools)
+
+    @property
+    def fill_pct(self) -> float:
+        t = self.total_blocks
+        return 100.0 * self.used_blocks / t if t > 0 else 0.0
+
+
+@dataclass
 class MemorySnapshot:
     pid: int
     ts: float
@@ -92,6 +120,25 @@ class MemorySnapshot:
     arena_size: int
     py_version: tuple[int, int]
     size_classes: list[SizeClassSummary]  # 32 entries, indices 0-31
+
+    @property
+    def arenas(self) -> list[ArenaSummary]:
+        """Build arena list grouped by pool.arena_index, sorted by arena_index."""
+        buckets: dict[int, list[PoolSnapshot]] = {}
+        for sc in self.size_classes:
+            for pool in sc.pools:
+                buckets.setdefault(pool.arena_index, []).append(pool)
+        result = []
+        for idx in sorted(buckets):
+            pools = buckets[idx]
+            result.append(
+                ArenaSummary(
+                    arena_index=idx,
+                    base_address=min(p.address for p in pools),
+                    pools=pools,
+                )
+            )
+        return result
 
     @property
     def total_pools(self) -> int:

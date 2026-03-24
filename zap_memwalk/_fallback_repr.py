@@ -8,6 +8,12 @@ from __future__ import annotations
 
 import struct as _s
 
+# CPython's cyclic GC prepends a 16-byte PyGC_Head to every GC-tracked object's
+# pymalloc allocation.  Callers pass raw block bytes (starting at the pymalloc
+# block base), so for GC-tracked types all PyObject field offsets are shifted by
+# this amount relative to non-GC types.
+_GC = 16
+
 
 def fallback_repr_from_raw(
     blk_bytes: bytes,
@@ -19,13 +25,18 @@ def fallback_repr_from_raw(
     Works even on freed blocks (ob_type at offset 8 is stale but still usable
     as a type hint; the inline payload is intact).
 
+    Offsets are relative to the pymalloc block start.  GC-tracked types have
+    a 16-byte PyGC_Head before the PyObject, so their payload starts at +32
+    (non-GC types start at +16, i.e. after ob_refcnt).
+
     str       — PyASCIIObject: length at +16, state at +32, ASCII data at +40/+48
     bytes     — PyBytesObject: ob_size at +16, data at +32
     float     — PyFloatObject: ob_fval (double) at +16
     int       — PyLongObject: ob_size/lv_tag at +16, digit[0] at +24
-    list/tuple — ob_size (item count) at +16
-    dict      — ma_used at +16
-    set/frozenset — used at +24
+    list/tuple — ob_size (item count) at +32  (GC-tracked, PyGC_Head at +0)
+    dict      — ma_used at +32                (GC-tracked)
+    set/frozenset — used at +40               (GC-tracked)
+    frame     — no inline data; returns '(freed frame)'
     module    — name resolved via name_hints; returns plain '(freed module)' here
     """
     try:
@@ -90,26 +101,28 @@ def fallback_repr_from_raw(
                     return f"(freed) int ({n}-digit)"
                 return None
         elif type_name in ("list", "tuple"):
-            if len(blk_bytes) < 24:
+            if len(blk_bytes) < _GC + 24:
                 return None
-            ob_size = _s.unpack_from("<q", blk_bytes, 16)[0]
+            ob_size = _s.unpack_from("<q", blk_bytes, _GC + 16)[0]
             if 0 <= ob_size <= 10**8:
                 return f"(freed) {type_name}[{ob_size}]"
             return None
         elif type_name == "dict":
-            if len(blk_bytes) < 24:
+            if len(blk_bytes) < _GC + 24:
                 return None
-            ma_used = _s.unpack_from("<q", blk_bytes, 16)[0]
+            ma_used = _s.unpack_from("<q", blk_bytes, _GC + 16)[0]
             if 0 <= ma_used <= 10**8:
                 return f"(freed) dict{{{ma_used}}}"
             return None
         elif type_name in ("set", "frozenset"):
-            if len(blk_bytes) < 32:
+            if len(blk_bytes) < _GC + 32:
                 return None
-            used = _s.unpack_from("<q", blk_bytes, 24)[0]
+            used = _s.unpack_from("<q", blk_bytes, _GC + 24)[0]
             if 0 <= used <= 10**8:
                 return f"(freed) {type_name}{{{used}}}"
             return None
+        elif type_name == "frame":
+            return "(freed frame)"
         elif type_name == "module":
             return "(freed module)"
     except Exception:

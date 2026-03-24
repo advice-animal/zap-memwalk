@@ -221,6 +221,40 @@ class MemWalkCollector:
         result["raw"] = bytes.fromhex(result.pop("rawHex", ""))
         return dict(result)
 
+    def read_pool_snapshot(self, pool_addr: int) -> "PoolSnapshot | None":
+        """Read pool header directly and return a PoolSnapshot, or None on failure.
+
+        Used as a fallback when scanAllPools() missed the pool (e.g. rwx range).
+        Applies the same maxnextoffset invariant as scanAllPools to reject non-pool memory.
+        """
+        try:
+            raw = self.read_pool(pool_addr)
+        except Exception:
+            return None
+        szidx = raw.get("szidx", 32)
+        if szidx >= 32:
+            return None
+        block_size = (szidx + 1) * 16
+        maxnextoffset = raw.get("maxnextoffset", 0)
+        # Exact invariant from CPython obmalloc.c: maxnextoffset == POOL_SIZE - block_size
+        if maxnextoffset != self._pool_size - block_size:
+            return None
+        nextoffset = raw.get("nextoffset", 0)
+        ref_count = raw.get("refCount", 0)
+        total_blocks = (self._pool_size - 48) // block_size
+        if ref_count > total_blocks or nextoffset > self._pool_size:
+            return None
+        return PoolSnapshot(
+            address=pool_addr,
+            arena_index=0,
+            szidx=szidx,
+            block_size=block_size,
+            ref_count=ref_count,
+            nextoffset=nextoffset,
+            maxnextoffset=maxnextoffset,
+            free_addresses=frozenset(int(a, 16) for a in raw.get("freeAddrs", [])),
+        )
+
     def repr_block(self, block_addr: int) -> tuple[str, str] | None:
         """Safely repr a live block; returns (type_name, repr_str) or None.
 
@@ -294,6 +328,11 @@ class MemWalkCollector:
             return str(cached) if cached.exists() else None
         # "true": use the original binary; eu-addr2line fetches via DEBUGINFOD_URLS
         return mod_path if os.path.exists(mod_path) else None
+
+    def get_range_protection(self, addr: int) -> str | None:
+        """Return the memory protection string for the range containing addr, or None."""
+        result = self._script.exports_sync.get_range_protection(f"{addr:x}")
+        return result if isinstance(result, str) else None
 
     def get_type_name(self, block_addr: int) -> str:
         """Read ob_type.tp_name for a block without GIL (best-effort)."""

@@ -164,9 +164,9 @@ rpc.exports = {
         try { run = makeSetupRunner(); }
         catch (e) { return {ok: false, error: e.message}; }
 
-        // Retrieve Python version via ctypes — no struct offset guessing needed.
+        // Retrieve Python version — no struct offset guessing needed.
         const ret = run(`
-import ctypes as _ct, sys as _sys, __main__ as _m
+import sys as _sys, __main__ as _m
 _m._mw_pymaj = _sys.version_info.major
 _m._mw_pymin = _sys.version_info.minor
 `);
@@ -220,15 +220,26 @@ _m._mw_pymin = _sys.version_info.minor
     reprBlock: function (blockAddrHex) {
         const blockPtr = ptr('0x' + blockAddrHex);
 
+        // For non-GC objects ob_type is at block+8; for GC-tracked objects (dict, list,
+        // frame, …) a 16-byte PyGC_Head precedes the PyObject so ob_type is at block+24.
+        let objPtr = blockPtr;
         let typeName = '?';
-        try {
-            const obType = blockPtr.add(8).readPointer();   // PyObject.ob_type
-            const tpName = obType.add(24).readPointer();    // PyTypeObject.tp_name
-            typeName = tpName.readUtf8String();
-        } catch (e) {}
+        for (const obTypeOff of [8, 24]) {
+            try {
+                const obType = blockPtr.add(obTypeOff).readPointer();
+                if (obType.isNull()) continue;
+                const tpNamePtr = obType.add(24).readPointer();
+                const name = tpNamePtr.readUtf8String();
+                if (name && name.length > 0 && !name.startsWith('\x00')) {
+                    typeName = name;
+                    if (obTypeOff === 24) objPtr = blockPtr.add(16);
+                    break;
+                }
+            } catch (_) {}
+        }
 
         let refcnt = 0;
-        try { refcnt = blockPtr.add(0).readU32(); } catch (e) {}
+        try { refcnt = objPtr.add(0).readU32(); } catch (_) {}
         if (refcnt === 0 || refcnt > 0x7fffffff) {
             return {ok: false, typeName, error: 'implausible refcount — block may be free'};
         }
@@ -242,11 +253,11 @@ _m._mw_pymin = _sys.version_info.minor
         const clearErr = nfn('PyErr_Clear',         'void',    []);
 
         const state = ensure();
-        incRef(blockPtr);
+        incRef(objPtr);
         let reprStr = null;
         let errMsg  = null;
         try {
-            const reprObj = reprFn(blockPtr);
+            const reprObj = reprFn(objPtr);
             if (!reprObj.isNull()) {
                 const cstr = asUtf8(reprObj);
                 reprStr = cstr.isNull() ? null : cstr.readUtf8String();
@@ -258,7 +269,7 @@ _m._mw_pymin = _sys.version_info.minor
         } catch (e) {
             errMsg = e.message;
         } finally {
-            decRef(blockPtr);
+            decRef(objPtr);
             release(state);
         }
 
@@ -283,6 +294,18 @@ _m._mw_pymin = _sys.version_info.minor
             }
         }
         return result;
+    },
+
+    // Return the memory protection string (e.g. 'rw-', 'rwx') for the range
+    // containing the given address, or null if the address is unmapped.
+    // NOTE: must be named getRangeProtection (camelCase) for Frida's Python→JS mapping.
+    getRangeProtection: function (addrHex) {
+        try {
+            const range = Process.findRangeByAddress(ptr('0x' + addrHex));
+            return range ? range.protection : null;
+        } catch (_) {
+            return null;
+        }
     },
 
     // Bulk-resolve addresses → {module, offset, symbol} or null.

@@ -220,10 +220,12 @@ class TestFallbackInt310:
 
 
 class TestFallbackListTuple:
+    # list/tuple are GC-tracked: PyGC_Head (16 bytes) sits before the PyObject
+    # in the pymalloc block, so ob_size is at block+32 (GC_HEAD + ob_refcnt + ob_type).
     @pytest.mark.parametrize("type_name", ["list", "tuple"])
     def test_happy_path(self, type_name):
-        buf = _buf(32)
-        struct.pack_into("<q", buf, 16, 7)
+        buf = _buf(48)
+        struct.pack_into("<q", buf, 32, 7)  # ob_size at GC_HEAD(16) + PyObject(16)
         assert (
             fallback_repr_from_raw(bytes(buf), type_name) == f"(freed) {type_name}[7]"
         )
@@ -234,8 +236,8 @@ class TestFallbackListTuple:
 
     @pytest.mark.parametrize("type_name", ["list", "tuple"])
     def test_negative_size_returns_none(self, type_name):
-        buf = _buf(32)
-        struct.pack_into("<q", buf, 16, -1)
+        buf = _buf(48)
+        struct.pack_into("<q", buf, 32, -1)
         assert fallback_repr_from_raw(bytes(buf), type_name) is None
 
 
@@ -243,17 +245,18 @@ class TestFallbackListTuple:
 
 
 class TestFallbackDict:
+    # dict is GC-tracked: ma_used is at block+32.
     def test_happy_path(self):
-        buf = _buf(32)
-        struct.pack_into("<q", buf, 16, 4)
+        buf = _buf(48)
+        struct.pack_into("<q", buf, 32, 4)  # ma_used at GC_HEAD(16) + PyObject(16)
         assert fallback_repr_from_raw(bytes(buf), "dict") == "(freed) dict{4}"
 
     def test_too_short_returns_none(self):
         assert fallback_repr_from_raw(b"\x00" * 10, "dict") is None
 
     def test_negative_used_returns_none(self):
-        buf = _buf(32)
-        struct.pack_into("<q", buf, 16, -1)
+        buf = _buf(48)
+        struct.pack_into("<q", buf, 32, -1)
         assert fallback_repr_from_raw(bytes(buf), "dict") is None
 
 
@@ -261,10 +264,13 @@ class TestFallbackDict:
 
 
 class TestFallbackSet:
+    # set/frozenset are GC-tracked: 'used' is at block+40 (fill at +32, used at +40).
     @pytest.mark.parametrize("type_name", ["set", "frozenset"])
     def test_happy_path(self, type_name):
-        buf = _buf(40)
-        struct.pack_into("<q", buf, 24, 3)
+        buf = _buf(64)
+        struct.pack_into(
+            "<q", buf, 40, 3
+        )  # used at GC_HEAD(16) + PyObject(16) + fill(8)
         assert (
             fallback_repr_from_raw(bytes(buf), type_name) == f"(freed) {type_name}{{3}}"
         )
@@ -275,9 +281,16 @@ class TestFallbackSet:
 
     @pytest.mark.parametrize("type_name", ["set", "frozenset"])
     def test_negative_used_returns_none(self, type_name):
-        buf = _buf(40)
-        struct.pack_into("<q", buf, 24, -1)
+        buf = _buf(64)
+        struct.pack_into("<q", buf, 40, -1)
         assert fallback_repr_from_raw(bytes(buf), type_name) is None
+
+
+# ── fallback_repr_from_raw: frame ─────────────────────────────────────────────
+
+
+def test_frame_returns_fixed_string():
+    assert fallback_repr_from_raw(b"\x00" * 64, "frame") == "(freed frame)"
 
 
 # ── fallback_repr_from_raw: module + unknown ──────────────────────────────────
