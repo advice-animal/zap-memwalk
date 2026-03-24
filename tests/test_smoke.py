@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from tests.conftest import frida_mark
 from zap_memwalk._collector import MemWalkCollector
 

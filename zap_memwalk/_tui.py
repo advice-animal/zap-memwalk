@@ -106,9 +106,13 @@ class MemWalkTUI:
         self._name_hints: dict[
             int, str
         ] = {}  # block_addr -> identifying string (code/module)
-        self._ob_type_syms: dict[int, str] = {}   # ob_type_ptr -> formatted symbol string
-        self._type_ptr_cache: dict[int, str] = {}  # ob_type_ptr -> type name (RPC cache)
-        self._rpc_lookups: int = 0                  # cumulative Frida RPC lookup count
+        self._ob_type_syms: dict[
+            int, str
+        ] = {}  # ob_type_ptr -> formatted symbol string
+        self._type_ptr_cache: dict[
+            int, str
+        ] = {}  # ob_type_ptr -> type name (RPC cache)
+        self._rpc_lookups: int = 0  # cumulative Frida RPC lookup count
 
         # Jump-to-address input state (activated by '/')
         self._jump_buf: str | None = (
@@ -379,13 +383,22 @@ class MemWalkTUI:
             )
 
         import struct as _struct
-        ob_type_ptr = _struct.unpack_from("<Q", blk_bytes, 8)[0] if len(blk_bytes) >= 16 else 0
+
+        ob_type_ptr = (
+            _struct.unpack_from("<Q", blk_bytes, 8)[0] if len(blk_bytes) >= 16 else 0
+        )
         if ob_type_ptr == 0:
-            ob_type_line = Text(f"ob_type → 0x0", style="dim", no_wrap=True)
+            ob_type_line = Text("ob_type → 0x0", style="dim", no_wrap=True)
         elif ob_type_ptr in self._ob_type_syms:
-            ob_type_line = Text(f"ob_type → {self._ob_type_syms[ob_type_ptr]}", style="dim", no_wrap=True)
+            ob_type_line = Text(
+                f"ob_type → {self._ob_type_syms[ob_type_ptr]}",
+                style="dim",
+                no_wrap=True,
+            )
         else:
-            ob_type_line = Text(f"ob_type → 0x{ob_type_ptr:x}", style="dim", no_wrap=True)
+            ob_type_line = Text(
+                f"ob_type → 0x{ob_type_ptr:x}", style="dim", no_wrap=True
+            )
 
         return Group(rule, content, status, ob_type_line)
 
@@ -634,7 +647,11 @@ class MemWalkTUI:
             info = self._col.symbolize_addresses([addr]).get(addr)
             if info is not None:
                 mod, offset, symbol = info["module"], info["offset"], info.get("symbol")
-                sym_label = f"{mod}!{symbol}" if symbol else (mod if offset == 0 else f"{mod}+0x{offset:x}")
+                sym_label = (
+                    f"{mod}!{symbol}"
+                    if symbol
+                    else (mod if offset == 0 else f"{mod}+0x{offset:x}")
+                )
         except Exception:
             pass
         raise RuntimeError(f"{sym_label} not in any pymalloc pool")

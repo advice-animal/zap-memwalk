@@ -311,7 +311,7 @@ _m._mw_pymin = _sys.version_info.minor
                 const symbolName = (rawName.length > 0 && !rawName.startsWith('0x'))
                     ? rawName : null;
 
-                result[addrHex] = { module: modName, offset: offset, symbol: symbolName };
+                result[addrHex] = { module: modName, path: mod ? mod.path : '', offset: offset, symbol: symbolName };
             } catch (_) {
                 result[addrHex] = null;
             }

@@ -67,10 +67,14 @@ def test_addr_json_live_float(known_float_proc):
     assert data["addr"] == f"0x{addr:x}"
     assert data["state"] == "live"
     assert data["type"] == "float"
-    assert data["size_class"] == 32  # PyFloatObject is 24 bytes → rounds to 32-byte block (szidx=1)
+    assert (
+        data["size_class"] == 32
+    )  # PyFloatObject is 24 bytes → rounds to 32-byte block (szidx=1)
     assert len(data["hex"].split()) == 16
     assert data["ob_type_symbol"] is not None
-    assert "float" in data["ob_type_symbol"].lower() or "Float" in data["ob_type_symbol"]
+    assert (
+        "float" in data["ob_type_symbol"].lower() or "Float" in data["ob_type_symbol"]
+    )
 
 
 @frida_mark
@@ -85,7 +89,14 @@ def test_addr_json_not_in_pool():
     addr = int(_ready_with_line(proc))
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "zap_memwalk", "--addr-json", str(addr), str(proc.pid)],
+            [
+                sys.executable,
+                "-m",
+                "zap_memwalk",
+                "--addr-json",
+                str(addr),
+                str(proc.pid),
+            ],
             capture_output=True,
             text=True,
             timeout=30,

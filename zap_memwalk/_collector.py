@@ -2,14 +2,107 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import struct
+import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from zap_memwalk._agent import _AGENT_JS
 from zap_memwalk._model import MemorySnapshot, PoolSnapshot, SizeClassSummary
 
 _NUM_SIZE_CLASSES = 32
+
+
+def _elf_build_id(path: str) -> str | None:
+    """Return the GNU build-id hex string from an ELF file, or None."""
+    try:
+        with open(path, "rb") as f:
+            ident = f.read(16)
+        if ident[:4] != b"\x7fELF":
+            return None
+        ei_class = ident[4]  # 1=32-bit, 2=64-bit
+        endian = "<" if ident[5] == 1 else ">"
+
+        with open(path, "rb") as f:
+            hdr_size = 64 if ei_class == 2 else 52
+            hdr = f.read(hdr_size)
+            if len(hdr) < hdr_size:
+                return None
+
+            if ei_class == 2:
+                e_phoff = struct.unpack_from(endian + "Q", hdr, 32)[0]
+                e_phentsize = struct.unpack_from(endian + "H", hdr, 54)[0]
+                e_phnum = struct.unpack_from(endian + "H", hdr, 56)[0]
+            else:
+                e_phoff = struct.unpack_from(endian + "I", hdr, 28)[0]
+                e_phentsize = struct.unpack_from(endian + "H", hdr, 42)[0]
+                e_phnum = struct.unpack_from(endian + "H", hdr, 44)[0]
+
+            for i in range(min(e_phnum, 64)):
+                f.seek(e_phoff + i * e_phentsize)
+                ph = f.read(e_phentsize)
+                if len(ph) < e_phentsize:
+                    break
+                p_type = struct.unpack_from(endian + "I", ph, 0)[0]
+                if p_type != 4:  # PT_NOTE
+                    continue
+                if ei_class == 2:
+                    p_offset = struct.unpack_from(endian + "Q", ph, 8)[0]
+                    p_filesz = struct.unpack_from(endian + "Q", ph, 32)[0]
+                else:
+                    p_offset = struct.unpack_from(endian + "I", ph, 4)[0]
+                    p_filesz = struct.unpack_from(endian + "I", ph, 16)[0]
+
+                f.seek(p_offset)
+                note_data = f.read(p_filesz)
+                pos = 0
+                while pos + 12 <= len(note_data):
+                    namesz, descsz, ntype = struct.unpack_from(
+                        endian + "III", note_data, pos
+                    )
+                    pos += 12
+                    name = note_data[pos : pos + namesz].rstrip(b"\x00")
+                    pos += (namesz + 3) & ~3
+                    desc = note_data[pos : pos + descsz]
+                    pos += (descsz + 3) & ~3
+                    if name == b"GNU" and ntype == 3:  # NT_GNU_BUILD_ID
+                        return desc.hex()
+    except Exception:
+        pass
+    return None
+
+
+def _debuginfod_cache_dir() -> Path:
+    xdg = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+    return Path(xdg) / "debuginfod_client"
+
+
+def _run_eu_addr2line(
+    offsets: list[int],
+    debug_file: str,
+    extra_env: dict[str, str] | None = None,
+) -> dict[int, str]:
+    """Run eu-addr2line -f for a batch of offsets; return {offset: symbol}."""
+    eu = shutil.which("eu-addr2line")
+    if not eu:
+        return {}
+    env = {**os.environ, **(extra_env or {})}
+    args = [eu, "-f", "-e", debug_file] + [f"0x{off:x}" for off in offsets]
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=30, env=env)
+        lines = r.stdout.splitlines()
+        # Output is interleaved: function_name\nfile:line per address
+        return {
+            off: lines[i * 2].strip()
+            for i, off in enumerate(offsets)
+            if i * 2 < len(lines) and lines[i * 2].strip() not in ("", "??")
+        }
+    except Exception:
+        return {}
 
 
 def _parse(
@@ -68,8 +161,13 @@ class MemWalkCollector:
             type_name, repr_str = col.repr_block(addr) or ("?", "")
     """
 
-    def __init__(self, pid: int) -> None:
+    def __init__(self, pid: int, debuginfod: str = "false") -> None:
+        if debuginfod not in ("false", "cached", "true"):
+            raise ValueError(
+                f"debuginfod must be 'false', 'cached', or 'true', got {debuginfod!r}"
+            )
         self._pid = pid
+        self._debuginfod = debuginfod
         self._session: Any = None
         self._script: Any = None
         self._pool_size: int = 16384
@@ -146,13 +244,54 @@ class MemWalkCollector:
         return {int(k, 16): v for k, v in result.items()}
 
     def symbolize_addresses(self, ptrs: list[int]) -> dict[int, dict[str, Any] | None]:
-        """Bulk-resolve addresses → {module, offset, symbol} or None (no GIL)."""
+        """Bulk-resolve addresses → {module, path, offset, symbol} or None (no GIL)."""
         if not ptrs:
             return {}
         unique = list({p for p in ptrs if p})
         hex_list = [f"{p:x}" for p in unique]
         result = self._script.exports_sync.symbolize_addresses(hex_list)
-        return {int(k, 16): (dict(v) if v else None) for k, v in result.items()}
+        out: dict[int, dict[str, Any] | None] = {
+            int(k, 16): (dict(v) if v else None) for k, v in result.items()
+        }
+        if self._debuginfod != "false":
+            self._enhance_with_debuginfod(out)
+        return out
+
+    def _enhance_with_debuginfod(
+        self, results: dict[int, dict[str, Any] | None]
+    ) -> None:
+        """Fill missing symbol names in-place using eu-addr2line + debuginfod."""
+        # Group addresses-without-symbols by module path.
+        by_path: dict[str, list[tuple[int, int]]] = {}  # path -> [(addr, offset)]
+        for addr, info in results.items():
+            if info is None or info.get("symbol") or not info.get("path"):
+                continue
+            by_path.setdefault(info["path"], []).append((addr, info["offset"]))
+
+        for mod_path, addr_offsets in by_path.items():
+            debug_file = self._resolve_debug_file(mod_path)
+            if debug_file is None:
+                continue
+            offsets = [off for _, off in addr_offsets]
+            # cached mode: pass empty DEBUGINFOD_URLS so eu-addr2line never fetches
+            extra_env: dict[str, str] | None = (
+                {"DEBUGINFOD_URLS": ""} if self._debuginfod == "cached" else None
+            )
+            sym_map = _run_eu_addr2line(offsets, debug_file, extra_env)
+            for addr, off in addr_offsets:
+                if off in sym_map:
+                    results[addr] = {**results[addr], "symbol": sym_map[off]}  # type: ignore[arg-type]
+
+    def _resolve_debug_file(self, mod_path: str) -> str | None:
+        """Return the file path to pass to eu-addr2line, or None to skip."""
+        if self._debuginfod == "cached":
+            build_id = _elf_build_id(mod_path)
+            if not build_id:
+                return None
+            cached = _debuginfod_cache_dir() / build_id / "debuginfo"
+            return str(cached) if cached.exists() else None
+        # "true": use the original binary; eu-addr2line fetches via DEBUGINFOD_URLS
+        return mod_path if os.path.exists(mod_path) else None
 
     def get_type_name(self, block_addr: int) -> str:
         """Read ob_type.tp_name for a block without GIL (best-effort)."""

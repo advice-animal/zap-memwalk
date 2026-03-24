@@ -141,10 +141,7 @@ def known_float_proc() -> Generator[tuple[int, int], None, None]:
 
     Uses a non-interned value so it's heap-allocated in a pymalloc pool.
     """
-    proc = _spawn(
-        "x = 1.5;"
-        " import sys; print(id(x), flush=True); sys.stdin.read()"
-    )
+    proc = _spawn("x = 1.5; import sys; print(id(x), flush=True); sys.stdin.read()")
     addr = int(_ready_with_line(proc))
     yield proc.pid, addr
     _teardown(proc)

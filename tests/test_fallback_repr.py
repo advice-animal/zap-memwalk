@@ -5,7 +5,6 @@ from __future__ import annotations
 import struct
 
 import pytest
-
 from zap_memwalk._fallback_repr import (
     cstr_hint,
     extract_cstr,
@@ -28,8 +27,8 @@ class TestFallbackStr:
         """Build a minimal PyASCIIObject-shaped buffer for *text*."""
         n = len(text)
         buf = _buf(data_off + n + extra)
-        struct.pack_into("<q", buf, 16, n)          # length
-        struct.pack_into("<I", buf, 32, 0x60)        # state: compact(0x20) | ascii(0x40)
+        struct.pack_into("<q", buf, 16, n)  # length
+        struct.pack_into("<I", buf, 32, 0x60)  # state: compact(0x20) | ascii(0x40)
         buf[data_off : data_off + n] = text.encode("ascii")
         return bytes(buf)
 
@@ -58,14 +57,14 @@ class TestFallbackStr:
 
     def test_length_too_large_returns_none(self):
         buf = _buf(64)
-        struct.pack_into("<q", buf, 16, 9999)        # way beyond buffer
+        struct.pack_into("<q", buf, 16, 9999)  # way beyond buffer
         struct.pack_into("<I", buf, 32, 0x60)
         assert fallback_repr_from_raw(bytes(buf), "str") is None
 
     def test_non_compact_ascii_returns_none(self):
         buf = _buf(64)
         struct.pack_into("<q", buf, 16, 3)
-        struct.pack_into("<I", buf, 32, 0x20)        # compact but not ascii
+        struct.pack_into("<I", buf, 32, 0x20)  # compact but not ascii
         buf[40:43] = b"abc"
         assert fallback_repr_from_raw(bytes(buf), "str") is None
 
@@ -73,7 +72,7 @@ class TestFallbackStr:
         buf = _buf(64)
         struct.pack_into("<q", buf, 16, 3)
         struct.pack_into("<I", buf, 32, 0x60)
-        buf[40:43] = b"\x80\x81\x82"                # high bytes — not ASCII
+        buf[40:43] = b"\x80\x81\x82"  # high bytes — not ASCII
         assert fallback_repr_from_raw(bytes(buf), "str") is None
 
 
@@ -83,7 +82,7 @@ class TestFallbackStr:
 class TestFallbackBytes:
     def test_happy_path(self):
         buf = _buf(48)
-        struct.pack_into("<q", buf, 16, 5)           # ob_size = 5
+        struct.pack_into("<q", buf, 16, 5)  # ob_size = 5
         buf[32:37] = b"hello"
         assert fallback_repr_from_raw(bytes(buf), "bytes") == "(freed) b'hello'"
 
@@ -137,23 +136,36 @@ class TestFallbackInt312:
         return bytes(buf)
 
     def test_zero(self):
-        assert fallback_repr_from_raw(self._buf_with_tag(1), "int", self.PY) == "(freed) 0"
+        assert (
+            fallback_repr_from_raw(self._buf_with_tag(1), "int", self.PY) == "(freed) 0"
+        )
 
     def test_compact_positive(self):
-        assert fallback_repr_from_raw(self._buf_with_tag(0, 42), "int", self.PY) == "(freed) 42"
+        assert (
+            fallback_repr_from_raw(self._buf_with_tag(0, 42), "int", self.PY)
+            == "(freed) 42"
+        )
 
     def test_compact_negative(self):
         # lv_tag=2 → sign bit set
-        assert fallback_repr_from_raw(self._buf_with_tag(2, 7), "int", self.PY) == "(freed) -7"
+        assert (
+            fallback_repr_from_raw(self._buf_with_tag(2, 7), "int", self.PY)
+            == "(freed) -7"
+        )
 
     def test_multi_digit(self):
         # lv_tag=24 → ndigits = 24>>3 = 3
-        assert fallback_repr_from_raw(self._buf_with_tag(24), "int", self.PY) == "(freed) int (3-digit)"
+        assert (
+            fallback_repr_from_raw(self._buf_with_tag(24), "int", self.PY)
+            == "(freed) int (3-digit)"
+        )
 
     def test_ndigits_too_large_returns_none(self):
         # ndigits = 10001 → beyond the 10000 guard
         lv_tag = 10001 << 3
-        assert fallback_repr_from_raw(self._buf_with_tag(lv_tag), "int", self.PY) is None
+        assert (
+            fallback_repr_from_raw(self._buf_with_tag(lv_tag), "int", self.PY) is None
+        )
 
     def test_too_short_returns_none(self):
         assert fallback_repr_from_raw(b"\x00" * 10, "int", self.PY) is None
@@ -172,19 +184,33 @@ class TestFallbackInt310:
         return bytes(buf)
 
     def test_zero(self):
-        assert fallback_repr_from_raw(self._buf_with_size(0), "int", self.PY) == "(freed) 0"
+        assert (
+            fallback_repr_from_raw(self._buf_with_size(0), "int", self.PY)
+            == "(freed) 0"
+        )
 
     def test_single_digit_positive(self):
-        assert fallback_repr_from_raw(self._buf_with_size(1, 99), "int", self.PY) == "(freed) 99"
+        assert (
+            fallback_repr_from_raw(self._buf_with_size(1, 99), "int", self.PY)
+            == "(freed) 99"
+        )
 
     def test_single_digit_negative(self):
-        assert fallback_repr_from_raw(self._buf_with_size(-1, 99), "int", self.PY) == "(freed) -99"
+        assert (
+            fallback_repr_from_raw(self._buf_with_size(-1, 99), "int", self.PY)
+            == "(freed) -99"
+        )
 
     def test_multi_digit(self):
-        assert fallback_repr_from_raw(self._buf_with_size(3), "int", self.PY) == "(freed) int (3-digit)"
+        assert (
+            fallback_repr_from_raw(self._buf_with_size(3), "int", self.PY)
+            == "(freed) int (3-digit)"
+        )
 
     def test_ndigits_too_large_returns_none(self):
-        assert fallback_repr_from_raw(self._buf_with_size(10001), "int", self.PY) is None
+        assert (
+            fallback_repr_from_raw(self._buf_with_size(10001), "int", self.PY) is None
+        )
 
     def test_too_short_returns_none(self):
         assert fallback_repr_from_raw(b"\x00" * 10, "int", self.PY) is None
@@ -198,7 +224,9 @@ class TestFallbackListTuple:
     def test_happy_path(self, type_name):
         buf = _buf(32)
         struct.pack_into("<q", buf, 16, 7)
-        assert fallback_repr_from_raw(bytes(buf), type_name) == f"(freed) {type_name}[7]"
+        assert (
+            fallback_repr_from_raw(bytes(buf), type_name) == f"(freed) {type_name}[7]"
+        )
 
     @pytest.mark.parametrize("type_name", ["list", "tuple"])
     def test_too_short_returns_none(self, type_name):
@@ -237,7 +265,9 @@ class TestFallbackSet:
     def test_happy_path(self, type_name):
         buf = _buf(40)
         struct.pack_into("<q", buf, 24, 3)
-        assert fallback_repr_from_raw(bytes(buf), type_name) == f"(freed) {type_name}{{3}}"
+        assert (
+            fallback_repr_from_raw(bytes(buf), type_name) == f"(freed) {type_name}{{3}}"
+        )
 
     @pytest.mark.parametrize("type_name", ["set", "frozenset"])
     def test_too_short_returns_none(self, type_name):
@@ -276,7 +306,7 @@ class TestCstrHint:
         assert cstr_hint(b"\x00" * 16) == ""
 
     def test_too_short_returns_empty(self):
-        assert cstr_hint(b"Hi") == ""   # < 8 bytes
+        assert cstr_hint(b"Hi") == ""  # < 8 bytes
 
     def test_control_char_in_first_8_falls_through_to_second_window(self):
         # first 8 bytes contain a non-printable; second window is printable
@@ -291,13 +321,13 @@ class TestExtractCstr:
     def test_start_at_0_with_null(self):
         # All 8 bytes printable → start=0; null terminates after the window.
         data = b"hello   " + b"\x00more"
-        assert extract_cstr(data) == "hello   "   # reads to null at index 8
+        assert extract_cstr(data) == "hello   "  # reads to null at index 8
 
     def test_start_at_8_with_null(self):
         # First 8 bytes non-printable; bytes 8-15 all printable → start=8.
         # Null terminator sits after the 8-byte window.
         data = b"\x01" * 8 + b"world!!!" + b"\x00xx"
-        assert extract_cstr(data) == "world!!!"   # reads to null at index 16
+        assert extract_cstr(data) == "world!!!"  # reads to null at index 16
 
     def test_no_null_reads_to_end(self):
         data = b"12345678"
@@ -307,10 +337,10 @@ class TestExtractCstr:
         assert extract_cstr(b"\x00" * 16) is None
 
     def test_empty_string_at_offset_0(self):
-        data = b" " * 8 + b"\x00more"      # first 8 all printable, then null
+        data = b" " * 8 + b"\x00more"  # first 8 all printable, then null
         # start=0, find null: no null in first 8, then at index 8
         result = extract_cstr(data)
-        assert result == "        "         # 8 spaces
+        assert result == "        "  # 8 spaces
 
 
 # ── hex_bytes ─────────────────────────────────────────────────────────────────
@@ -318,7 +348,7 @@ class TestExtractCstr:
 
 class TestHexBytes:
     def test_single_row(self):
-        out = hex_bytes(b"\x41\x42\x43")    # "ABC"
+        out = hex_bytes(b"\x41\x42\x43")  # "ABC"
         assert "41 42 43" in out
         assert "ABC" in out
         assert out.startswith("0000")

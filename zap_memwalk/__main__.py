@@ -43,13 +43,25 @@ def main() -> None:
         metavar="ADDR",
         help="dump JSON for the single pymalloc block containing ADDR (hex or decimal), or null",
     )
+    ap.add_argument(
+        "--debuginfod",
+        choices=("false", "cached", "true"),
+        default="false",
+        metavar="MODE",
+        help=(
+            "debuginfod symbol enrichment on Linux: "
+            "'false' (default) = off; "
+            "'cached' = use only already-downloaded debuginfod files; "
+            "'true' = fetch from DEBUGINFOD_URLS if needed"
+        ),
+    )
     args = ap.parse_args()
 
     from zap_memwalk._collector import MemWalkCollector  # noqa: PLC0415
     from zap_memwalk._tui import MemWalkTUI  # noqa: PLC0415
 
     try:
-        with MemWalkCollector(args.pid) as col:
+        with MemWalkCollector(args.pid, debuginfod=args.debuginfod) as col:
             if args.json:
                 snap = col.collect()
                 print(json.dumps(snap.to_dict(), indent=2))
@@ -86,18 +98,33 @@ def main() -> None:
                 if found_pool is None:
                     sym_label = f"0x{args.addr_json:x}"
                     try:
-                        info = col.symbolize_addresses([args.addr_json]).get(args.addr_json)
+                        info = col.symbolize_addresses([args.addr_json]).get(
+                            args.addr_json
+                        )
                         if info is not None:
-                            mod, offset, symbol = info["module"], info["offset"], info.get("symbol")
-                            sym_label = f"{mod}!{symbol}" if symbol else (mod if offset == 0 else f"{mod}+0x{offset:x}")
+                            mod, offset, symbol = (
+                                info["module"],
+                                info["offset"],
+                                info.get("symbol"),
+                            )
+                            sym_label = (
+                                f"{mod}!{symbol}"
+                                if symbol
+                                else (mod if offset == 0 else f"{mod}+0x{offset:x}")
+                            )
                     except Exception:
                         pass
-                    print(json.dumps({"error": "not in any pymalloc pool", "symbol": sym_label}))
+                    print(
+                        json.dumps(
+                            {"error": "not in any pymalloc pool", "symbol": sym_label}
+                        )
+                    )
                     return
                 pool_raw = col.read_pool(found_pool.address)
                 block_size = (pool_raw.get("szidx", found_pool.szidx) + 1) * 16
                 off = args.addr_json - pool_addr
                 from zap_memwalk._model import POOL_OVERHEAD  # noqa: PLC0415
+
                 if off < POOL_OVERHEAD or (off - POOL_OVERHEAD) % block_size != 0:
                     print("null")
                     return
@@ -181,11 +208,15 @@ def _pool_blocks_json(col: object, pool: object, pool_raw: dict) -> list[dict]:
     # Batch-resolve type names and symbols.
     unique_ptrs = list({p for _, p in ob_type_ptrs})
     try:
-        type_names: dict[int, str] = col.resolve_type_names(unique_ptrs) if unique_ptrs else {}
+        type_names: dict[int, str] = (
+            col.resolve_type_names(unique_ptrs) if unique_ptrs else {}
+        )
     except Exception:
         type_names = {}
     try:
-        sym_results: dict[int, dict | None] = col.symbolize_addresses(unique_ptrs) if unique_ptrs else {}
+        sym_results: dict[int, dict | None] = (
+            col.symbolize_addresses(unique_ptrs) if unique_ptrs else {}
+        )
     except Exception:
         sym_results = {}
 
@@ -206,7 +237,9 @@ def _pool_blocks_json(col: object, pool: object, pool_raw: dict) -> list[dict]:
         ob_type_ptr = slot.pop("_ob_type_ptr")
         slot["type"] = type_names.get(ob_type_ptr, "") if ob_type_ptr else ""
         slot["hex"] = " ".join(f"{b:02x}" for b in blk[:16])
-        slot["ob_type_symbol"] = _fmt_sym(ob_type_ptr, sym_results.get(ob_type_ptr)) if ob_type_ptr else None
+        slot["ob_type_symbol"] = (
+            _fmt_sym(ob_type_ptr, sym_results.get(ob_type_ptr)) if ob_type_ptr else None
+        )
         result.append(slot)
     return result
 
