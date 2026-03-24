@@ -33,7 +33,7 @@ class TestCollect:
         the 32-byte size class should have substantial utilisation."""
         with MemWalkCollector(alloc_proc.pid) as col:
             snap = col.collect()
-        sc32 = snap.size_classes[1]   # szidx=1 → 32-byte blocks
+        sc32 = snap.size_classes[1]  # szidx=1 → 32-byte blocks
         assert sc32.pool_count >= 1, "expected at least one 32-byte pool"
         assert sc32.used_blocks >= 400_000, (
             f"expected ≥400k used blocks in 32-byte class, got {sc32.used_blocks}"
@@ -46,7 +46,9 @@ class TestCollect:
             snap = col.collect()
         sc32 = snap.size_classes[1]
         total_free = sum(len(p.free_addresses) for p in sc32.pools)
-        assert total_free > 0, "expected at least some free-listed blocks in 32-byte pools"
+        assert total_free > 0, (
+            "expected at least some free-listed blocks in 32-byte pools"
+        )
 
     @frida_mark
     def test_multiple_collects(self, idle_proc):

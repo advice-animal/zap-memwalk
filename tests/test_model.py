@@ -11,14 +11,14 @@ from zap_memwalk._model import (
     PoolSnapshot,
     SizeClassSummary,
 )
-from zap_memwalk._tui import _fill_bar, _clamp_viewport
+from zap_memwalk._tui import _clamp_viewport, _fill_bar
 
 
 def _make_pool(
     address: int = 0x1000_0000,
     szidx: int = 1,
     ref_count: int = 100,
-    nextoffset: int = 3248,   # some bytes into pool
+    nextoffset: int = 3248,  # some bytes into pool
     maxnextoffset: int = 16320,
     free_addresses: frozenset[int] = frozenset(),
 ) -> PoolSnapshot:
@@ -37,7 +37,6 @@ def _make_pool(
 
 class TestPoolSnapshot:
     def test_pool_size_derived_from_maxnextoffset(self):
-        pool = _make_pool(szidx=1, maxnextoffset=16320)
         # pool_size = maxnextoffset + POOL_OVERHEAD + block_size = 16320 + 48 + 32 = 16400
         # but canonical is 16384; maxnextoffset = 16384 - 48 - 32 = 16304
         pool2 = _make_pool(szidx=1, maxnextoffset=16304)
@@ -57,17 +56,19 @@ class TestPoolSnapshot:
         assert pool.fill_pct == 0.0
 
     def test_block_state_live(self):
-        addr = 0x1000_0030   # offset 48 from pool at 0x1000_0000
+        addr = 0x1000_0030  # offset 48 from pool at 0x1000_0000
         free = frozenset({0x1000_0050})
-        pool = _make_pool(address=0x1000_0000, szidx=1,
-                          nextoffset=512, free_addresses=free)
+        pool = _make_pool(
+            address=0x1000_0000, szidx=1, nextoffset=512, free_addresses=free
+        )
         assert pool.block_state(addr) == BlockState.LIVE
 
     def test_block_state_free(self):
         addr = 0x1000_0050
         free = frozenset({addr})
-        pool = _make_pool(address=0x1000_0000, szidx=1,
-                          nextoffset=512, free_addresses=free)
+        pool = _make_pool(
+            address=0x1000_0000, szidx=1, nextoffset=512, free_addresses=free
+        )
         assert pool.block_state(addr) == BlockState.FREE
 
     def test_block_state_unborn(self):
@@ -104,7 +105,9 @@ class TestMemorySnapshot:
     def _make_snap(self) -> MemorySnapshot:
         p = _make_pool(ref_count=50, maxnextoffset=16304)
         sc = SizeClassSummary(szidx=1, block_size=32, pools=[p])
-        empties = [SizeClassSummary(szidx=i, block_size=(i + 1) * 16) for i in range(32)]
+        empties = [
+            SizeClassSummary(szidx=i, block_size=(i + 1) * 16) for i in range(32)
+        ]
         empties[1] = sc
         return MemorySnapshot(
             pid=999,
@@ -120,7 +123,7 @@ class TestMemorySnapshot:
         d = snap.to_dict()
         assert d["pid"] == 999
         assert d["py_version"] == [3, 13]
-        assert len(d["size_classes"]) == 1   # only non-empty classes
+        assert len(d["size_classes"]) == 1  # only non-empty classes
         assert d["size_classes"][0]["szidx"] == 1
 
     def test_total_pools(self):

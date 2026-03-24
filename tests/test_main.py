@@ -5,17 +5,23 @@ from __future__ import annotations
 import subprocess
 import sys
 
-import pytest
-
-from tests.conftest import frida_mark, _spawn, _ready
+from tests.conftest import frida_mark
 
 
 @frida_mark
 def test_once_prints_summary(idle_proc):
     """--once should print a text table and exit cleanly."""
     result = subprocess.run(
-        [sys.executable, "-m", "coverage", "run", "-m", "zap_memwalk",
-         "--once", str(idle_proc.pid)],
+        [
+            sys.executable,
+            "-m",
+            "coverage",
+            "run",
+            "-m",
+            "zap_memwalk",
+            "--once",
+            str(idle_proc.pid),
+        ],
         capture_output=True,
         text=True,
         timeout=30,

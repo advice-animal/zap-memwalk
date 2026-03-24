@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
-
 POOL_OVERHEAD = 48  # sizeof(pool_header) rounded up to 16-byte alignment
 
 
@@ -17,14 +16,14 @@ class BlockState(Enum):
 
 @dataclass(frozen=True)
 class PoolSnapshot:
-    address: int          # pool_header address in target process
-    arena_index: int      # index into allarenas[]
-    szidx: int            # 0-31, block size class
-    block_size: int       # (szidx + 1) * 16
-    ref_count: int        # pool_header.ref.count (allocated blocks)
-    nextoffset: int       # pool_header.nextoffset (byte watermark from pool base)
-    maxnextoffset: int    # pool_header.maxnextoffset
-    free_addresses: frozenset[int]   # from walking pool_header.freeblock list
+    address: int  # pool_header address in target process
+    arena_index: int  # index into allarenas[]
+    szidx: int  # 0-31, block size class
+    block_size: int  # (szidx + 1) * 16
+    ref_count: int  # pool_header.ref.count (allocated blocks)
+    nextoffset: int  # pool_header.nextoffset (byte watermark from pool base)
+    maxnextoffset: int  # pool_header.maxnextoffset
+    free_addresses: frozenset[int]  # from walking pool_header.freeblock list
 
     @property
     def pool_size(self) -> int:

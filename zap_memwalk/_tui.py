@@ -18,17 +18,23 @@ import time
 from enum import Enum, auto
 from typing import Any
 
+from rich import box
 from rich.console import Console, Group
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
-from rich import box
 
 from zap_memwalk._collector import MemWalkCollector
 from zap_memwalk._fallback_repr import (
-    fallback_repr_from_raw as _fallback_repr_from_raw,
     cstr_hint as _cstr_hint,
+)
+from zap_memwalk._fallback_repr import (
     extract_cstr as _extract_cstr,
+)
+from zap_memwalk._fallback_repr import (
+    fallback_repr_from_raw as _fallback_repr_from_raw,
+)
+from zap_memwalk._fallback_repr import (
     hex_bytes as _hex_bytes,
 )
 from zap_memwalk._model import (
@@ -36,7 +42,6 @@ from zap_memwalk._model import (
     BlockState,
     MemorySnapshot,
     PoolSnapshot,
-    SizeClassSummary,
 )
 
 _POOL_OVERHEAD = 48
@@ -44,8 +49,8 @@ _POOL_OVERHEAD = 48
 
 class _View(Enum):
     SIZE_CLASS = auto()
-    POOL       = auto()
-    BLOCK      = auto()
+    POOL = auto()
+    BLOCK = auto()
 
 
 def _fill_bar(fill_pct: float, width: int = 20) -> Text:
@@ -73,14 +78,6 @@ def _pct_text(pct: float) -> Text:
     return Text(s, style="green")
 
 
-from zap_memwalk._fallback_repr import (
-    fallback_repr_from_raw as _fallback_repr_from_raw,
-    cstr_hint as _cstr_hint,
-    extract_cstr as _extract_cstr,
-    hex_bytes as _hex_bytes,
-)
-
-
 class MemWalkTUI:
     """Three-level interactive TUI: size-class → pool → block."""
 
@@ -89,28 +86,32 @@ class MemWalkTUI:
         collector: MemWalkCollector,
         interval: float = 1.0,
     ) -> None:
-        self._col      = collector
+        self._col = collector
         self._interval = interval
         self._snap: MemorySnapshot | None = None
-        self._age      = BlockAgeTracker()
+        self._age = BlockAgeTracker()
 
-        self._view     = _View.SIZE_CLASS
-        self._cursor   = 0           # row cursor in the current view
-        self._vp_start = 0           # viewport first row
+        self._view = _View.SIZE_CLASS
+        self._cursor = 0  # row cursor in the current view
+        self._vp_start = 0  # viewport first row
 
         # Selected size class / pool for drill-down
-        self._sel_szidx:  int | None = None
-        self._sel_pool:   PoolSnapshot | None = None
+        self._sel_szidx: int | None = None
+        self._sel_pool: PoolSnapshot | None = None
 
         # Block view state
-        self._pool_raw:   dict[str, Any] | None = None  # from read_pool()
-        self._repr_lines: list[tuple[int, str]] = []    # (block_addr, repr_text)
-        self._type_names: dict[int, str] = {}           # block_addr -> type name
-        self._name_hints: dict[int, str] = {}           # block_addr -> identifying string (code/module)
+        self._pool_raw: dict[str, Any] | None = None  # from read_pool()
+        self._repr_lines: list[tuple[int, str]] = []  # (block_addr, repr_text)
+        self._type_names: dict[int, str] = {}  # block_addr -> type name
+        self._name_hints: dict[
+            int, str
+        ] = {}  # block_addr -> identifying string (code/module)
 
         # Jump-to-address input state (activated by '/')
-        self._jump_buf:   str | None = None   # None = not in jump mode; str = current input
-        self._jump_err:   str = ""            # shown after a failed jump
+        self._jump_buf: str | None = (
+            None  # None = not in jump mode; str = current input
+        )
+        self._jump_err: str = ""  # shown after a failed jump
 
         self._keys: queue.SimpleQueue[str] = queue.SimpleQueue()
 
@@ -140,9 +141,7 @@ class MemWalkTUI:
             self._vp_start, self._cursor, height, total_rows
         )
 
-        for row_i, sc in enumerate(
-            classes[self._vp_start : self._vp_start + height]
-        ):
+        for row_i, sc in enumerate(classes[self._vp_start : self._vp_start + height]):
             abs_i = row_i + self._vp_start
             cursor_mark = "▶" if abs_i == self._cursor else " "
             t.add_row(
@@ -174,9 +173,7 @@ class MemWalkTUI:
             self._vp_start, self._cursor, height, total_rows
         )
 
-        for row_i, pool in enumerate(
-            pools[self._vp_start : self._vp_start + height]
-        ):
+        for row_i, pool in enumerate(pools[self._vp_start : self._vp_start + height]):
             abs_i = row_i + self._vp_start
             cursor_mark = "▶" if abs_i == self._cursor else " "
             t.add_row(
@@ -200,16 +197,13 @@ class MemWalkTUI:
         if self._sel_pool is None or self._pool_raw is None:
             return t
 
-        pool  = self._sel_pool
-        raw   = bytes(self._pool_raw.get("raw", b"") or b"")
+        pool = self._sel_pool
+        raw = bytes(self._pool_raw.get("raw", b"") or b"")
         szidx = self._pool_raw.get("szidx", pool.szidx)
-        nextoffset    = self._pool_raw.get("nextoffset", pool.nextoffset)
-        maxnextoffset = self._pool_raw.get("maxnextoffset", pool.maxnextoffset)
-        block_size    = (szidx + 1) * 16
+        nextoffset = self._pool_raw.get("nextoffset", pool.nextoffset)
+        block_size = (szidx + 1) * 16
 
-        free_set = frozenset(
-            int(a, 16) for a in self._pool_raw.get("freeAddrs", [])
-        )
+        free_set = frozenset(int(a, 16) for a in self._pool_raw.get("freeAddrs", []))
         now = time.monotonic()
 
         # Build block list
@@ -238,21 +232,29 @@ class MemWalkTUI:
 
             if state == BlockState.UNBORN:
                 state_text = Text("unborn", style="dim")
-                type_text  = Text(_cstr_hint(blk_bytes), style="italic dim")
-                content    = Text(_hex_bytes(blk_bytes[:16]), style="dim")
+                type_text = Text(_cstr_hint(blk_bytes), style="italic dim")
+                content = Text(_hex_bytes(blk_bytes[:16]), style="dim")
             elif state == BlockState.FREE:
                 state_text = Text("free", style="bright_black")
-                raw_type   = self._type_names.get(addr, "")
-                eff_type   = raw_type if (raw_type and raw_type != "?") else _cstr_hint(blk_bytes)
-                type_text  = Text(eff_type, style="bright_black")
-                content    = Text(_hex_bytes(blk_bytes[:16]), style="bright_black")
+                raw_type = self._type_names.get(addr, "")
+                eff_type = (
+                    raw_type
+                    if (raw_type and raw_type != "?")
+                    else _cstr_hint(blk_bytes)
+                )
+                type_text = Text(eff_type, style="bright_black")
+                content = Text(_hex_bytes(blk_bytes[:16]), style="bright_black")
             else:
-                color      = self._age.color(addr, now)
+                color = self._age.color(addr, now)
                 state_text = Text("live", style=color)
-                raw_type   = self._type_names.get(addr, "")
-                eff_type   = raw_type if (raw_type and raw_type != "?") else _cstr_hint(blk_bytes)
-                type_text  = Text(eff_type, style="dim")
-                content    = Text(_hex_bytes(blk_bytes[:16]), style=color, no_wrap=True)
+                raw_type = self._type_names.get(addr, "")
+                eff_type = (
+                    raw_type
+                    if (raw_type and raw_type != "?")
+                    else _cstr_hint(blk_bytes)
+                )
+                type_text = Text(eff_type, style="dim")
+                content = Text(_hex_bytes(blk_bytes[:16]), style=color, no_wrap=True)
 
             t.add_row(
                 cursor_mark,
@@ -268,17 +270,18 @@ class MemWalkTUI:
         snap = self._snap
         if snap is None:
             return Text("zap-memwalk — connecting…", style="bold")
-        pid_info  = f"PID {snap.pid}"
-        ver_info  = f"Python {snap.py_version[0]}.{snap.py_version[1]}"
+        pid_info = f"PID {snap.pid}"
+        ver_info = f"Python {snap.py_version[0]}.{snap.py_version[1]}"
         pool_info = f"{snap.pool_size // 1024}KiB pools"
 
         view_crumb = {
             _View.SIZE_CLASS: "size classes",
-            _View.POOL:       f"size-class {self._sel_szidx} ({((self._sel_szidx or 0) + 1) * 16}B pools)",
-            _View.BLOCK:      (
+            _View.POOL: f"size-class {self._sel_szidx} ({((self._sel_szidx or 0) + 1) * 16}B pools)",
+            _View.BLOCK: (
                 f"pool 0x{self._sel_pool.address:x}"
                 f"  sz{self._sel_pool.szidx} ({self._sel_pool.block_size}B)"
-                if self._sel_pool else ""
+                if self._sel_pool
+                else ""
             ),
         }[self._view]
 
@@ -307,11 +310,11 @@ class MemWalkTUI:
         if self._sel_pool is None or self._pool_raw is None:
             return Group(Rule(style="dim"), Text(""))
 
-        raw        = bytes(self._pool_raw.get("raw", b"") or b"")
-        szidx      = self._pool_raw.get("szidx", self._sel_pool.szidx)
+        raw = bytes(self._pool_raw.get("raw", b"") or b"")
+        szidx = self._pool_raw.get("szidx", self._sel_pool.szidx)
         block_size = (szidx + 1) * 16
         nextoffset = self._pool_raw.get("nextoffset", self._sel_pool.nextoffset)
-        free_set   = frozenset(int(a, 16) for a in self._pool_raw.get("freeAddrs", []))
+        free_set = frozenset(int(a, 16) for a in self._pool_raw.get("freeAddrs", []))
 
         blocks = [
             (off, self._sel_pool.address + off)
@@ -320,11 +323,13 @@ class MemWalkTUI:
         if self._cursor >= len(blocks):
             return Group(Rule(style="dim"), Text(""))
 
-        off, addr  = blocks[self._cursor]
-        blk_bytes  = raw[off : off + block_size]
-        raw_type   = self._type_names.get(addr, "")
-        eff_type   = raw_type if (raw_type and raw_type != "?") else _cstr_hint(blk_bytes)
-        state_str  = "unborn" if off >= nextoffset else ("free" if addr in free_set else "live")
+        off, addr = blocks[self._cursor]
+        blk_bytes = raw[off : off + block_size]
+        raw_type = self._type_names.get(addr, "")
+        eff_type = raw_type if (raw_type and raw_type != "?") else _cstr_hint(blk_bytes)
+        state_str = (
+            "unborn" if off >= nextoffset else ("free" if addr in free_set else "live")
+        )
 
         title_parts = [f"0x{addr:x}"]
         if eff_type:
@@ -389,11 +394,11 @@ class MemWalkTUI:
         if self._sel_pool is None or self._pool_raw is None:
             return
         import struct
-        raw       = bytes(self._pool_raw.get("raw", b"") or b"")
-        szidx     = self._pool_raw.get("szidx", self._sel_pool.szidx)
+
+        raw = bytes(self._pool_raw.get("raw", b"") or b"")
+        szidx = self._pool_raw.get("szidx", self._sel_pool.szidx)
         nextoffset = self._pool_raw.get("nextoffset", self._sel_pool.nextoffset)
         block_size = (szidx + 1) * 16
-        free_set  = frozenset(int(a, 16) for a in self._pool_raw.get("freeAddrs", []))
 
         # Collect (block_addr, ob_type_ptr) for live AND free blocks.
         # When a block is freed, CPython overwrites only offset 0-7 (ob_refcnt)
@@ -479,7 +484,7 @@ class MemWalkTUI:
     def _refresh_full(self) -> None:
         """Full arena scan — used for size-class and pool views."""
         snap = self._col.collect()
-        now  = snap.ts
+        now = snap.ts
         live: set[int] = set()
         for sc in snap.size_classes:
             for pool in sc.pools:
@@ -500,11 +505,11 @@ class MemWalkTUI:
         self._resolve_block_types()
 
         # Update age tracker from this pool's block states
-        raw        = bytes(self._pool_raw.get("raw", b"") or b"")
-        szidx      = self._pool_raw.get("szidx", self._sel_pool.szidx)
+        raw = bytes(self._pool_raw.get("raw", b"") or b"")
+        szidx = self._pool_raw.get("szidx", self._sel_pool.szidx)
         block_size = (szidx + 1) * 16
         nextoffset = self._pool_raw.get("nextoffset", self._sel_pool.nextoffset)
-        free_set   = frozenset(int(a, 16) for a in self._pool_raw.get("freeAddrs", []))
+        free_set = frozenset(int(a, 16) for a in self._pool_raw.get("freeAddrs", []))
         live: set[int] = set()
         for off in range(_POOL_OVERHEAD, len(raw), block_size):
             addr = self._sel_pool.address + off
@@ -522,9 +527,15 @@ class MemWalkTUI:
         if self._view == _View.POOL and self._sel_szidx is not None:
             return len(self._snap.size_classes[self._sel_szidx].pools)
         if self._view == _View.BLOCK and self._sel_pool is not None:
-            szidx = self._pool_raw.get("szidx", self._sel_pool.szidx) if self._pool_raw else self._sel_pool.szidx
-            blk   = (szidx + 1) * 16
-            raw   = bytes(self._pool_raw.get("raw", b"") or b"") if self._pool_raw else b""
+            szidx = (
+                self._pool_raw.get("szidx", self._sel_pool.szidx)
+                if self._pool_raw
+                else self._sel_pool.szidx
+            )
+            blk = (szidx + 1) * 16
+            raw = (
+                bytes(self._pool_raw.get("raw", b"") or b"") if self._pool_raw else b""
+            )
             return max(0, (len(raw) - _POOL_OVERHEAD) // blk) if blk else 0
         return 0
 
@@ -543,11 +554,11 @@ class MemWalkTUI:
                 if pool.address == pool_addr:
                     # Navigate: switch to pool view for this size class
                     self._sel_szidx = sc.szidx
-                    self._view      = _View.POOL
-                    self._cursor    = pool_idx
-                    self._vp_start  = 0
+                    self._view = _View.POOL
+                    self._cursor = pool_idx
+                    self._vp_start = 0
                     # Immediately drill into block view
-                    self._sel_pool  = pool
+                    self._sel_pool = pool
                     try:
                         self._pool_raw = self._col.read_pool(pool.address)
                     except Exception:
@@ -556,18 +567,23 @@ class MemWalkTUI:
                     self._type_names = {}
                     self._name_hints = {}
                     self._resolve_block_types()
-                    self._view     = _View.BLOCK
+                    self._view = _View.BLOCK
                     self._vp_start = 0
                     # Position cursor on the target block
                     block_size = (sc.szidx + 1) * 16
                     off = addr - pool_addr
-                    if off >= _POOL_OVERHEAD and (off - _POOL_OVERHEAD) % block_size == 0:
+                    if (
+                        off >= _POOL_OVERHEAD
+                        and (off - _POOL_OVERHEAD) % block_size == 0
+                    ):
                         self._cursor = (off - _POOL_OVERHEAD) // block_size
                     else:
                         self._cursor = 0
                     return
 
-        raise RuntimeError(f"address 0x{addr:x} → pool 0x{pool_addr:x} not found in snapshot")
+        raise RuntimeError(
+            f"address 0x{addr:x} → pool 0x{pool_addr:x} not found in snapshot"
+        )
 
     def _enter(self) -> None:
         if self._snap is None:
@@ -576,13 +592,13 @@ class MemWalkTUI:
             active = [sc for sc in self._snap.size_classes if sc.pool_count > 0]
             if self._cursor < len(active):
                 self._sel_szidx = active[self._cursor].szidx
-                self._view      = _View.POOL
-                self._cursor    = 0
-                self._vp_start  = 0
+                self._view = _View.POOL
+                self._cursor = 0
+                self._vp_start = 0
         elif self._view == _View.POOL and self._sel_szidx is not None:
             pools = self._snap.size_classes[self._sel_szidx].pools
             if self._cursor < len(pools):
-                self._sel_pool  = pools[self._cursor]
+                self._sel_pool = pools[self._cursor]
                 try:
                     self._pool_raw = self._col.read_pool(self._sel_pool.address)
                 except Exception:
@@ -591,7 +607,7 @@ class MemWalkTUI:
                 self._type_names = {}
                 self._name_hints = {}
                 self._resolve_block_types()
-                self._view  = _View.BLOCK
+                self._view = _View.BLOCK
                 self._cursor = 0
                 self._vp_start = 0
 
@@ -599,14 +615,18 @@ class MemWalkTUI:
         if self._view == _View.BLOCK:
             # Return to pool view; restore cursor to the pool we were viewing.
             cursor = 0
-            if self._snap is not None and self._sel_szidx is not None and self._sel_pool is not None:
+            if (
+                self._snap is not None
+                and self._sel_szidx is not None
+                and self._sel_pool is not None
+            ):
                 pools = self._snap.size_classes[self._sel_szidx].pools
                 for i, p in enumerate(pools):
                     if p.address == self._sel_pool.address:
                         cursor = i
                         break
-            self._view     = _View.POOL
-            self._cursor   = cursor
+            self._view = _View.POOL
+            self._cursor = cursor
             self._vp_start = 0
             self._repr_lines = []
             self._type_names = {}
@@ -620,13 +640,17 @@ class MemWalkTUI:
                     if sc.szidx == self._sel_szidx:
                         cursor = i
                         break
-            self._view     = _View.SIZE_CLASS
-            self._cursor   = cursor
+            self._view = _View.SIZE_CLASS
+            self._cursor = cursor
             self._vp_start = 0
 
     def _do_repr(self) -> None:
         """Repr selected block (block view only)."""
-        if self._view != _View.BLOCK or self._sel_pool is None or self._pool_raw is None:
+        if (
+            self._view != _View.BLOCK
+            or self._sel_pool is None
+            or self._pool_raw is None
+        ):
             return
         szidx = self._pool_raw.get("szidx", self._sel_pool.szidx)
         block_size = (szidx + 1) * 16
@@ -641,22 +665,30 @@ class MemWalkTUI:
         if self._cursor >= len(blocks):
             return
         addr = blocks[self._cursor]
-        off  = addr - self._sel_pool.address
+        off = addr - self._sel_pool.address
         blk_bytes = raw[off : off + block_size]
-        raw_type  = self._type_names.get(addr, "")
-        eff_type  = raw_type if (raw_type and raw_type != "?") else _cstr_hint(blk_bytes)
+        raw_type = self._type_names.get(addr, "")
+        eff_type = raw_type if (raw_type and raw_type != "?") else _cstr_hint(blk_bytes)
 
         if eff_type == "cstr":
             # Display null-terminated string; never call repr_block on cstr data.
             cstr_val = _extract_cstr(blk_bytes)
-            line = f"0x{addr:x} [cstr]: {repr(cstr_val)}" if cstr_val is not None else f"0x{addr:x} [cstr]: (empty)"
+            line = (
+                f"0x{addr:x} [cstr]: {repr(cstr_val)}"
+                if cstr_val is not None
+                else f"0x{addr:x} [cstr]: (empty)"
+            )
         elif off >= nextoffset or addr in free_set:
             if addr in self._name_hints:
                 line = f"0x{addr:x} [freed {eff_type}]: {self._name_hints[addr]}"
             else:
                 py_ver = self._snap.py_version if self._snap else (3, 10)
                 fallback = _fallback_repr_from_raw(blk_bytes, raw_type, py_ver)
-                line = f"0x{addr:x}: {fallback}" if fallback else f"0x{addr:x}: (free / unborn — cannot repr)"
+                line = (
+                    f"0x{addr:x}: {fallback}"
+                    if fallback
+                    else f"0x{addr:x}: (free / unborn — cannot repr)"
+                )
         else:
             result = self._col.repr_block(addr)
             if result is not None:
@@ -665,22 +697,22 @@ class MemWalkTUI:
             else:
                 line = f"0x{addr:x}: repr failed"
         # Replace existing repr for this address or append
-        self._repr_lines = [
-            (a, t) for a, t in self._repr_lines if a != addr
-        ]
+        self._repr_lines = [(a, t) for a, t in self._repr_lines if a != addr]
         self._repr_lines.append((addr, line))
 
     def _handle_key(self, ch: str) -> bool:
         """Process one keypress. Returns True if we should quit."""
         # ── jump-to-address input mode ─────────────────────────────────────
         if self._jump_buf is not None:
-            if ch in ("\r", "\n"):          # confirm
+            if ch in ("\r", "\n"):  # confirm
                 self._jump_err = ""
                 try:
                     addr = int(self._jump_buf, 0)  # 0x… = hex, else decimal
                     self._jump_to(addr)
                 except ValueError:
-                    self._jump_err = f"invalid address: {self._jump_buf!r} (use 0x… or decimal)"
+                    self._jump_err = (
+                        f"invalid address: {self._jump_buf!r} (use 0x… or decimal)"
+                    )
                 except Exception as e:
                     self._jump_err = str(e)
                 self._jump_buf = None
@@ -699,17 +731,17 @@ class MemWalkTUI:
         n = self._current_list_len()
         h = shutil.get_terminal_size().lines
         page = max(1, h - 9)
-        if ch == "\x1b[A" or ch == "k":              # up
+        if ch == "\x1b[A" or ch == "k":  # up
             self._cursor = max(0, self._cursor - 1)
-        elif ch == "\x1b[B" or ch == "j":            # down
+        elif ch == "\x1b[B" or ch == "j":  # down
             self._cursor = min(max(0, n - 1), self._cursor + 1)
-        elif ch == "n" or ch == "\x1b[6~":           # page down
+        elif ch == "n" or ch == "\x1b[6~":  # page down
             self._cursor = min(max(0, n - 1), self._cursor + page)
-        elif ch == "p" or ch == "\x1b[5~":           # page up
+        elif ch == "p" or ch == "\x1b[5~":  # page up
             self._cursor = max(0, self._cursor - page)
-        elif ch in ("\r", "\n", "o"):                # Enter / o
+        elif ch in ("\r", "\n", "o"):  # Enter / o
             self._enter()
-        elif ch in ("b", "\x1b"):                    # back / Escape
+        elif ch in ("b", "\x1b"):  # back / Escape
             self._back()
         elif ch == "/":
             self._jump_buf = ""
@@ -732,8 +764,8 @@ class MemWalkTUI:
         """
         import os
         import select as _sel
-        import tty
         import termios
+        import tty
 
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
@@ -756,8 +788,9 @@ class MemWalkTUI:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
     def run(self) -> None:
-        from rich.live import Live
         import threading
+
+        from rich.live import Live
 
         # Initial snapshot
         try:
@@ -772,7 +805,9 @@ class MemWalkTUI:
         console = Console()
         last_refresh = time.monotonic()
 
-        with Live(self._render(), console=console, screen=True, auto_refresh=False) as live:
+        with Live(
+            self._render(), console=console, screen=True, auto_refresh=False
+        ) as live:
             try:
                 while True:
                     # Drain the key queue
@@ -805,6 +840,7 @@ class MemWalkTUI:
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _clamp_viewport(vp_start: int, cursor: int, height: int, total: int) -> int:
     """Return a viewport start that keeps cursor visible."""

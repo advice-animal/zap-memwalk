@@ -115,11 +115,13 @@ class MemWalkCollector:
         Returns a dict with keys: szidx, refCount, nextoffset, maxnextoffset,
         freeAddrs (list of hex strings), raw (bytes).
         """
-        result = self._script.exports_sync.read_pool(f"{pool_addr:x}")  # Frida maps → readPool
+        result = self._script.exports_sync.read_pool(
+            f"{pool_addr:x}"
+        )  # Frida maps → readPool
         if not result.get("ok"):
             raise RuntimeError(result.get("error"))
         result["raw"] = bytes.fromhex(result.pop("rawHex", ""))
-        return result
+        return dict(result)
 
     def repr_block(self, block_addr: int) -> tuple[str, str] | None:
         """Safely repr a live block; returns (type_name, repr_str) or None.
@@ -146,7 +148,7 @@ class MemWalkCollector:
     def get_type_name(self, block_addr: int) -> str:
         """Read ob_type.tp_name for a block without GIL (best-effort)."""
         result = self._script.exports_sync.repr_block(f"{block_addr:x}")
-        return result.get("typeName", "?")
+        return str(result.get("typeName", "?"))
 
     def __exit__(self, *_: object) -> None:
         if self._script is not None:

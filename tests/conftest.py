@@ -73,6 +73,7 @@ def _ready_with_line(proc: subprocess.Popen[bytes], timeout: float = 15.0) -> st
 
 # ── idle / allocation fixtures ────────────────────────────────────────────────
 
+
 @pytest.fixture()
 def idle_proc() -> Generator[subprocess.Popen[bytes], None, None]:
     """Spawn a Python interpreter blocking on stdin with no extra allocations."""
@@ -98,12 +99,12 @@ def alloc_proc() -> Generator[subprocess.Popen[bytes], None, None]:
 # The child prints  id(obj)  on stdout before blocking so the test can target
 # the exact address.  Use _ready_with_line() to read the address line.
 
+
 @pytest.fixture()
 def known_list_proc() -> Generator[tuple[int, int], None, None]:
     """Process holding a 1000-element list; yields (pid, address_of_list)."""
     proc = _spawn(
-        "x = [1] * 1000;"
-        " import sys; print(id(x), flush=True); sys.stdin.read()"
+        "x = [1] * 1000; import sys; print(id(x), flush=True); sys.stdin.read()"
     )
     addr = int(_ready_with_line(proc))
     yield proc.pid, addr

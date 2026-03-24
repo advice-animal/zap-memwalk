@@ -36,15 +36,17 @@ def fallback_repr_from_raw(
             if not (0 < length < len(blk_bytes) - 36):
                 return None
             state = _s.unpack_from("<I", blk_bytes, 32)[0]
-            if (state & 0x60) != 0x60:          # must be compact + ascii
+            if (state & 0x60) != 0x60:  # must be compact + ascii
                 return None
-            for data_off in (40, 48):            # 3.12+ then ≤3.11
+            for data_off in (40, 48):  # 3.12+ then ≤3.11
                 end = data_off + length
                 if end <= len(blk_bytes):
                     payload = blk_bytes[data_off:end]
                     # Null bytes mean we hit the wstr pointer slot (≤3.11) — skip.
                     if b"\x00" not in payload and all(b < 128 for b in payload):
-                        return "(freed) " + repr(payload.decode("ascii", errors="replace"))
+                        return "(freed) " + repr(
+                            payload.decode("ascii", errors="replace")
+                        )
             return None
         elif type_name == "bytes":
             if len(blk_bytes) < 33:
@@ -65,9 +67,9 @@ def fallback_repr_from_raw(
                 # lv_tag: bits 0-2 = flags; SIGN_ZERO=1, SIGN_NEGATIVE=2
                 # compact = lv_tag < 16; digit at +24
                 lv_tag = _s.unpack_from("<Q", blk_bytes, 16)[0]
-                if lv_tag == 1:                         # SIGN_ZERO
+                if lv_tag == 1:  # SIGN_ZERO
                     return "(freed) 0"
-                if lv_tag < 16:                         # compact single-digit
+                if lv_tag < 16:  # compact single-digit
                     digit = _s.unpack_from("<I", blk_bytes, 24)[0]
                     sign = -1 if (lv_tag & 2) else 1
                     return f"(freed) {sign * digit}"
@@ -91,21 +93,21 @@ def fallback_repr_from_raw(
             if len(blk_bytes) < 24:
                 return None
             ob_size = _s.unpack_from("<q", blk_bytes, 16)[0]
-            if 0 <= ob_size <= 10 ** 8:
+            if 0 <= ob_size <= 10**8:
                 return f"(freed) {type_name}[{ob_size}]"
             return None
         elif type_name == "dict":
             if len(blk_bytes) < 24:
                 return None
             ma_used = _s.unpack_from("<q", blk_bytes, 16)[0]
-            if 0 <= ma_used <= 10 ** 8:
+            if 0 <= ma_used <= 10**8:
                 return f"(freed) dict{{{ma_used}}}"
             return None
         elif type_name in ("set", "frozenset"):
             if len(blk_bytes) < 32:
                 return None
             used = _s.unpack_from("<q", blk_bytes, 24)[0]
-            if 0 <= used <= 10 ** 8:
+            if 0 <= used <= 10**8:
                 return f"(freed) {type_name}{{{used}}}"
             return None
         elif type_name == "module":
