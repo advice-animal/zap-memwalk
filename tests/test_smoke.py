@@ -43,11 +43,22 @@ class TestCollect:
 
     @frida_mark
     def test_free_addresses_detected(self, alloc_proc):
-        """After freeing every other int, some blocks should be in free lists."""
+        """After freeing every other int, some blocks should be in free lists.
+
+        Free lists are fetched lazily via read_pool() rather than collect(),
+        so verify via read_pool_snapshot() on the collected pools.
+        """
         with MemWalkCollector(alloc_proc.pid) as col:
             snap = col.collect()
-        sc32 = snap.size_classes[1]
-        total_free = sum(len(p.free_addresses) for p in sc32.pools)
+            sc32 = snap.size_classes[1]
+            assert sc32.pool_count >= 1, "no 32-byte pools found"
+            total_free = 0
+            for pool in sc32.pools:
+                ps = col.read_pool_snapshot(pool.address)
+                if ps is not None:
+                    total_free += len(ps.free_addresses)
+                if total_free > 0:
+                    break
         assert total_free > 0, (
             "expected at least some free-listed blocks in 32-byte pools"
         )

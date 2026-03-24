@@ -135,11 +135,8 @@ function scanAllPools() {
                 if (nextoffset > POOL_SIZE)  continue;
 
                 const paddr  = chunkStart + off;
-                const poolPtr = ptr('0x' + paddr.toString(16));
-                const maxBl  = Math.ceil(totalBlocks) + 2;
 
                 const arenaIndex = dv.getUint32(off + 32, true);
-                const freeAddrs  = walkFreeList(poolPtr, maxBl);
 
                 pools.push({
                     address:      paddr.toString(16),
@@ -148,7 +145,7 @@ function scanAllPools() {
                     refCount,
                     nextoffset,
                     maxnextoffset,
-                    freeAddrs,
+                    freeAddrs:    [],   // deferred to readPool() to keep collect() payload small
                 });
             }
         }
