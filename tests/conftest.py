@@ -77,7 +77,7 @@ def _ready_with_line(proc: subprocess.Popen[bytes], timeout: float = 15.0) -> st
 @pytest.fixture()
 def idle_proc() -> Generator[subprocess.Popen[bytes], None, None]:
     """Spawn a Python interpreter blocking on stdin with no extra allocations."""
-    proc = _spawn("import sys; print(flush=True); sys.stdin.read()")
+    proc = _spawn("import sys; print('x', flush=True); sys.stdin.read()")
     _ready(proc)
     yield proc
     _teardown(proc)
