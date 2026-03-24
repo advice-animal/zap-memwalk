@@ -5,6 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from zap_memwalk._collector import MemWalkCollector
+    from zap_memwalk._model import PoolSnapshot
 
 
 def main() -> None:
@@ -165,14 +170,15 @@ def _print_text(snap: object) -> None:
     )
 
 
-def _pool_blocks_json(col: object, pool: object, pool_raw: dict) -> list[dict]:
+def _pool_blocks_json(
+    col: "MemWalkCollector",
+    pool: "PoolSnapshot",
+    pool_raw: dict[str, Any],
+) -> list[dict[str, Any]]:
     """Return a list of block-info dicts for every slot in the pool."""
     import struct
 
-    from zap_memwalk._collector import MemWalkCollector  # noqa: PLC0415
     from zap_memwalk._model import POOL_OVERHEAD  # noqa: PLC0415
-
-    assert isinstance(col, MemWalkCollector)
 
     raw = bytes(pool_raw.get("raw", b"") or b"")
     szidx = pool_raw.get("szidx", pool.szidx)
@@ -181,7 +187,7 @@ def _pool_blocks_json(col: object, pool: object, pool_raw: dict) -> list[dict]:
     free_set = frozenset(int(a, 16) for a in pool_raw.get("freeAddrs", []))
 
     # First pass: collect blocks and born ob_type pointers for batch RPC.
-    slots: list[dict] = []
+    slots: list[dict[str, Any]] = []
     ob_type_ptrs: list[tuple[int, int]] = []  # (addr, ob_type_ptr)
     for off in range(POOL_OVERHEAD, len(raw), block_size):
         addr = pool.address + off
@@ -214,13 +220,13 @@ def _pool_blocks_json(col: object, pool: object, pool_raw: dict) -> list[dict]:
     except Exception:
         type_names = {}
     try:
-        sym_results: dict[int, dict | None] = (
+        sym_results: dict[int, dict[str, Any] | None] = (
             col.symbolize_addresses(unique_ptrs) if unique_ptrs else {}
         )
     except Exception:
         sym_results = {}
 
-    def _fmt_sym(ptr: int, info: dict | None) -> str:
+    def _fmt_sym(ptr: int, info: dict[str, Any] | None) -> str:
         if info is None:
             return f"<unmapped 0x{ptr:x}>"
         mod = info["module"]

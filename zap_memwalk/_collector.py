@@ -280,7 +280,9 @@ class MemWalkCollector:
             sym_map = _run_eu_addr2line(offsets, debug_file, extra_env)
             for addr, off in addr_offsets:
                 if off in sym_map:
-                    results[addr] = {**results[addr], "symbol": sym_map[off]}  # type: ignore[arg-type]
+                    existing = results[addr]
+                    if existing is not None:
+                        results[addr] = {**existing, "symbol": sym_map[off]}
 
     def _resolve_debug_file(self, mod_path: str) -> str | None:
         """Return the file path to pass to eu-addr2line, or None to skip."""

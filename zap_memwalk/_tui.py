@@ -842,8 +842,15 @@ class MemWalkTUI:
         import termios
         import tty
 
+        import atexit
+
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
+
+        def _restore() -> None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+        atexit.register(_restore)
         try:
             tty.setcbreak(fd)
             buf = b""
@@ -860,7 +867,7 @@ class MemWalkTUI:
                 self._keys.put(buf.decode("utf-8", errors="replace"))
                 buf = b""
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            _restore()
 
     def run(self) -> None:
         import threading
