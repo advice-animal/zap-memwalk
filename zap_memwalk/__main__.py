@@ -62,96 +62,103 @@ def main() -> None:
             "'true' = fetch from DEBUGINFOD_URLS if needed"
         ),
     )
+    ap.add_argument(
+        "--trace",
+        type=argparse.FileType("w"),
+        metavar="FILE",
+        help="write a Chrome-trace (keke) JSON to FILE",
+    )
     args = ap.parse_args()
 
     from zap_memwalk._collector import MemWalkCollector  # noqa: PLC0415
     from zap_memwalk._tui import MemWalkTUI  # noqa: PLC0415
 
-    try:
-        with MemWalkCollector(args.pid, debuginfod=args.debuginfod) as col:
-            if args.json:
-                snap = col.collect()
-                print(json.dumps(snap.to_dict(), indent=2))
-                return
-            if args.once:
-                snap = col.collect()
-                _print_text(snap)
-                return
-            if args.size_json is not None:
-                snap = col.collect()
-                szidx = (args.size_json + 15) // 16 - 1
-                szidx = max(0, min(szidx, 31))
-                sc = snap.size_classes[szidx]
-                if not sc.pools:
-                    print(json.dumps([]))
+    with keke.TraceOutput(file=args.trace):
+        try:
+            with MemWalkCollector(args.pid, debuginfod=args.debuginfod) as col:
+                if args.json:
+                    snap = col.collect()
+                    print(json.dumps(snap.to_dict(), indent=2))
                     return
-                pool = sc.pools[0]
-                pool_raw = col.read_pool(pool.address)
-                blocks = _pool_blocks_json(col, pool, pool_raw)
-                print(json.dumps(blocks, indent=2))
-                return
-            if args.addr_json is not None:
-                snap = col.collect()
-                pool_size = snap.pool_size
-                pool_addr = args.addr_json & ~(pool_size - 1)
-                found_pool = None
-                for sc in snap.size_classes:
-                    for p in sc.pools:
-                        if p.address == pool_addr:
-                            found_pool = p
+                if args.once:
+                    snap = col.collect()
+                    _print_text(snap)
+                    return
+                if args.size_json is not None:
+                    snap = col.collect()
+                    szidx = (args.size_json + 15) // 16 - 1
+                    szidx = max(0, min(szidx, 31))
+                    sc = snap.size_classes[szidx]
+                    if not sc.pools:
+                        print(json.dumps([]))
+                        return
+                    pool = sc.pools[0]
+                    pool_raw = col.read_pool(pool.address)
+                    blocks = _pool_blocks_json(col, pool, pool_raw)
+                    print(json.dumps(blocks, indent=2))
+                    return
+                if args.addr_json is not None:
+                    snap = col.collect()
+                    pool_size = snap.pool_size
+                    pool_addr = args.addr_json & ~(pool_size - 1)
+                    found_pool = None
+                    for sc in snap.size_classes:
+                        for p in sc.pools:
+                            if p.address == pool_addr:
+                                found_pool = p
+                                break
+                        if found_pool:
                             break
-                    if found_pool:
-                        break
-                if found_pool is None:
-                    # Fallback: pool may not appear in scanAllPools() (e.g. rwx range).
-                    found_pool = col.read_pool_snapshot(pool_addr)
+                    if found_pool is None:
+                        # Fallback: pool may not appear in scanAllPools() due to timing races.
+                        found_pool = col.read_pool_snapshot(pool_addr)
 
-                if found_pool is None:
-                    sym_label = f"0x{args.addr_json:x}"
-                    try:
-                        info = col.symbolize_addresses([args.addr_json]).get(
-                            args.addr_json
-                        )
-                        if info is not None:
-                            mod, offset, symbol = (
-                                info["module"],
-                                info["offset"],
-                                info.get("symbol"),
+                    if found_pool is None:
+                        sym_label = f"0x{args.addr_json:x}"
+                        try:
+                            info = col.symbolize_addresses([args.addr_json]).get(
+                                args.addr_json
                             )
-                            sym_label = (
-                                f"{mod}!{symbol}"
-                                if symbol
-                                else (mod if offset == 0 else f"{mod}+0x{offset:x}")
+                            if info is not None:
+                                mod, offset, symbol = (
+                                    info["module"],
+                                    info["offset"],
+                                    info.get("symbol"),
+                                )
+                                sym_label = (
+                                    f"{mod}!{symbol}"
+                                    if symbol
+                                    else (mod if offset == 0 else f"{mod}+0x{offset:x}")
+                                )
+                        except Exception:
+                            pass
+                        print(
+                            json.dumps(
+                                {"error": "not in any pymalloc pool", "symbol": sym_label}
                             )
-                    except Exception:
-                        pass
-                    print(
-                        json.dumps(
-                            {"error": "not in any pymalloc pool", "symbol": sym_label}
                         )
-                    )
-                    return
-                pool_raw = col.read_pool(found_pool.address)
-                block_size = (pool_raw.get("szidx", found_pool.szidx) + 1) * 16
-                off = args.addr_json - pool_addr
-                from zap_memwalk._model import POOL_OVERHEAD  # noqa: PLC0415
+                        return
+                    pool_raw = col.read_pool(found_pool.address)
+                    block_size = (pool_raw.get("szidx", found_pool.szidx) + 1) * 16
+                    off = args.addr_json - pool_addr
+                    from zap_memwalk._model import POOL_OVERHEAD  # noqa: PLC0415
 
-                if off < POOL_OVERHEAD:
-                    print("null")
+                    if off < POOL_OVERHEAD:
+                        print("null")
+                        return
+                    block_idx = (off - POOL_OVERHEAD) // block_size
+                    block_addr = pool_addr + POOL_OVERHEAD + block_idx * block_size
+                    blocks = _pool_blocks_json(col, found_pool, pool_raw)
+                    target = f"0x{block_addr:x}"
+                    match = next((b for b in blocks if b["addr"] == target), None)
+                    print(json.dumps(match, indent=2))
                     return
-                block_idx = (off - POOL_OVERHEAD) // block_size
-                block_addr = pool_addr + POOL_OVERHEAD + block_idx * block_size
-                blocks = _pool_blocks_json(col, found_pool, pool_raw)
-                target = f"0x{block_addr:x}"
-                match = next((b for b in blocks if b["addr"] == target), None)
-                print(json.dumps(match, indent=2))
-                return
-            MemWalkTUI(col, interval=args.interval).run()
-    except RuntimeError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        pass
+                MemWalkTUI(col, interval=args.interval).run()
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except KeyboardInterrupt:
+            pass
 
 
 @keke.ktrace()
@@ -273,5 +280,4 @@ def _pool_blocks_json(
 
 
 if __name__ == "__main__":
-    with keke.TraceOutput(open("trace.out", "w")):
-        main()
+    main()
