@@ -22,6 +22,7 @@ import time
 from enum import Enum, auto
 from typing import Any
 
+import keke
 from rich import box
 from rich.console import Console, Group
 from rich.rule import Rule
@@ -118,9 +119,15 @@ class MemWalkTUI:
         collector: MemWalkCollector,
         interval: float = 1.0,
     ) -> None:
+        import threading
+
         self._col = collector
         self._interval = interval
         self._snap: MemorySnapshot | None = None
+        # Prevents concurrent Frida RPC from the background refresh thread and
+        # an explicit 'R' keypress.  Background thread uses acquire(blocking=False)
+        # to skip a cycle if a manual refresh is already in progress.
+        self._collect_lock = threading.Lock()
         self._age = BlockAgeTracker()
 
         self._hier_mode: str = "size"  # "size" | "arena"
@@ -536,6 +543,7 @@ class MemWalkTUI:
 
         return Group(rule, content, status, ob_type_line)
 
+    @keke.ktrace()
     def _render(self) -> Group:
         h = shutil.get_terminal_size().lines
         if self._view == _View.BLOCK:
@@ -728,19 +736,12 @@ class MemWalkTUI:
         else:
             self._refresh_full()
 
+    @keke.ktrace()
     def _refresh_full(self) -> None:
         """Full arena scan — used for size-class and pool views."""
-        snap = self._col.collect()
-        now = snap.ts
-        live: set[int] = set()
-        for sc in snap.size_classes:
-            for pool in sc.pools:
-                for addr in pool.iter_block_addresses():
-                    if pool.block_state(addr) == BlockState.LIVE:
-                        live.add(addr)
-        self._age.update(live, now)
-        self._snap = snap
+        self._snap = self._col.collect_streaming()
 
+    @keke.ktrace()
     def _refresh_block_view(self) -> None:
         """Fast path: re-read only the current pool (no full arena scan)."""
         assert self._sel_pool is not None
@@ -1198,7 +1199,8 @@ class MemWalkTUI:
         elif ch == "r":
             self._do_repr()
         elif ch == "R":
-            self._refresh()
+            with self._collect_lock:
+                self._refresh()
         return False
 
     # ── main loop ─────────────────────────────────────────────────────────────
@@ -1254,18 +1256,34 @@ class MemWalkTUI:
             print(f"Error during initial collect: {exc}", file=sys.stderr)
             return
 
-        t = threading.Thread(target=self._key_reader, daemon=True)
-        t.start()
+        def _refresh_loop() -> None:
+            while not _stop.is_set():
+                _stop.wait(self._interval)
+                if _stop.is_set():
+                    break
+                # Skip this cycle if a manual refresh (R key) is in progress.
+                if self._collect_lock.acquire(blocking=False):
+                    try:
+                        self._refresh()
+                    except Exception:
+                        pass
+                    finally:
+                        self._collect_lock.release()
+
+        _stop = threading.Event()
+        t_key = threading.Thread(target=self._key_reader, daemon=True)
+        t_ref = threading.Thread(target=_refresh_loop, daemon=True)
+        t_key.start()
+        t_ref.start()
 
         console = Console()
-        last_refresh = time.monotonic()
 
         with Live(
             self._render(), console=console, screen=True, auto_refresh=False
         ) as live:
             try:
                 while True:
-                    # Drain the key queue
+                    # Drain the key queue — never blocks on data collection.
                     quit_requested = False
                     while not self._keys.empty():
                         try:
@@ -1278,20 +1296,15 @@ class MemWalkTUI:
                     if quit_requested:
                         break
 
-                    # Periodic refresh
-                    now = time.monotonic()
-                    if now - last_refresh >= self._interval:
-                        try:
-                            self._refresh()
-                        except Exception:
-                            pass
-                        last_refresh = now
-
-                    live.update(self._render())
-                    live.refresh()
+                    with keke.kev("live.update"):
+                        live.update(self._render())
+                    with keke.kev("live.refresh"):
+                        live.refresh()
                     time.sleep(0.05)
             except KeyboardInterrupt:
                 pass
+            finally:
+                _stop.set()
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────

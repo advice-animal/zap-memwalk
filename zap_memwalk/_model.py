@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import cached_property
 
 POOL_OVERHEAD = 48  # sizeof(pool_header) rounded up to 16-byte alignment
 
@@ -14,7 +15,7 @@ class BlockState(Enum):
     UNBORN = "unborn"  # address >= pool_header.nextoffset (never carved off)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PoolSnapshot:
     address: int  # pool_header address in target process
     arena_index: int  # index into allarenas[]
@@ -70,15 +71,15 @@ class SizeClassSummary:
     def pool_count(self) -> int:
         return len(self.pools)
 
-    @property
+    @cached_property
     def used_blocks(self) -> int:
         return sum(p.ref_count for p in self.pools)
 
-    @property
+    @cached_property
     def total_blocks(self) -> int:
         return sum(p.total_blocks for p in self.pools)
 
-    @property
+    @cached_property
     def fill_pct(self) -> float:
         t = self.total_blocks
         return 100.0 * self.used_blocks / t if t > 0 else 0.0
@@ -98,15 +99,15 @@ class ArenaSummary:
     def pool_count(self) -> int:
         return len(self.pools)
 
-    @property
+    @cached_property
     def used_blocks(self) -> int:
         return sum(p.ref_count for p in self.pools)
 
-    @property
+    @cached_property
     def total_blocks(self) -> int:
         return sum(p.total_blocks for p in self.pools)
 
-    @property
+    @cached_property
     def fill_pct(self) -> float:
         t = self.total_blocks
         return 100.0 * self.used_blocks / t if t > 0 else 0.0
@@ -121,7 +122,7 @@ class MemorySnapshot:
     py_version: tuple[int, int]
     size_classes: list[SizeClassSummary]  # 32 entries, indices 0-31
 
-    @property
+    @cached_property
     def arenas(self) -> list[ArenaSummary]:
         """Build arena list grouped by pool.arena_index, sorted by arena_index."""
         buckets: dict[int, list[PoolSnapshot]] = {}
@@ -183,7 +184,7 @@ class BlockAgeTracker:
         for addr in live_addrs:
             if addr not in self._first_seen:
                 self._first_seen[addr] = now
-        gone = set(self._first_seen) - live_addrs
+        gone = self._first_seen.keys() - live_addrs
         for addr in gone:
             del self._first_seen[addr]
 

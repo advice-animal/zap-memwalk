@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import keke
+
 from zap_memwalk._agent import _AGENT_JS
 from zap_memwalk._model import MemorySnapshot, PoolSnapshot, SizeClassSummary
 
@@ -105,6 +107,7 @@ def _run_eu_addr2line(
         return {}
 
 
+@keke.ktrace("ts")
 def _parse(
     raw_pools: list[dict[str, Any]],
     pid: int,
@@ -123,7 +126,8 @@ def _parse(
             continue
         block_size = (szidx + 1) * 16
         addr = int(p["address"], 16)
-        free_addresses = frozenset(int(a, 16) for a in p["freeAddrs"])
+        _free = p.get("freeAddrs") or []
+        free_addresses = frozenset(int(a, 16) for a in _free) if _free else frozenset()
         snap = PoolSnapshot(
             address=addr,
             arena_index=p["arenaIndex"],
@@ -174,6 +178,7 @@ class MemWalkCollector:
         self._arena_size: int = 1048576
         self._py_version: tuple[int, int] = (0, 0)
 
+    @keke.ktrace()
     def __enter__(self) -> "MemWalkCollector":
         import frida  # noqa: PLC0415
 
@@ -193,9 +198,11 @@ class MemWalkCollector:
         if msg.get("type") == "error":
             print(f"[zap-memwalk] {msg.get('description', msg)}", file=sys.stderr)
 
+    @keke.ktrace()
     def collect(self) -> MemorySnapshot:
         """Take one full snapshot: all arenas → all pools → free lists."""
-        result = self._script.exports_sync.collect()
+        with keke.kev("exports_sync.collect"):
+            result = self._script.exports_sync.collect()
         if not result.get("ok"):
             raise RuntimeError(result.get("error"))
         return _parse(
@@ -207,6 +214,29 @@ class MemWalkCollector:
             self._py_version,
         )
 
+    @keke.ktrace()
+    def collect_streaming(self) -> MemorySnapshot:
+        """Filtered single-call collect: scans only 1 MiB rw- ranges.
+
+        Uses the ARENA_SIZE size heuristic + a 48-byte probe to skip non-arena
+        regions before reading each arena in full.  One Frida RPC call, so no
+        per-arena round-trip overhead.  Returns the same MemorySnapshot as
+        collect().
+        """
+        with keke.kev("exports_sync.collectFiltered"):
+            result = self._script.exports_sync.collect_filtered()
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error"))
+        return _parse(
+            result["pools"],
+            self._pid,
+            time.monotonic(),
+            self._pool_size,
+            self._arena_size,
+            self._py_version,
+        )
+
+    @keke.ktrace("pool_addr")
     def read_pool(self, pool_addr: int) -> dict[str, Any]:
         """Return raw block data for a single pool (for the block view).
 
@@ -221,6 +251,7 @@ class MemWalkCollector:
         result["raw"] = bytes.fromhex(result.pop("rawHex", ""))
         return dict(result)
 
+    @keke.ktrace("pool_addr")
     def read_pool_snapshot(self, pool_addr: int) -> "PoolSnapshot | None":
         """Read pool header directly and return a PoolSnapshot, or None on failure.
 
@@ -255,6 +286,7 @@ class MemWalkCollector:
             free_addresses=frozenset(int(a, 16) for a in raw.get("freeAddrs", [])),
         )
 
+    @keke.ktrace("block_addr")
     def repr_block(self, block_addr: int) -> tuple[str, str] | None:
         """Safely repr a live block; returns (type_name, repr_str) or None.
 
@@ -268,6 +300,44 @@ class MemWalkCollector:
         # On failure still return typeName so the TUI can show it
         return None
 
+    @keke.ktrace()
+    def list_arenas(self) -> list[dict[str, Any]]:
+        """Full scan → one entry per arena: {arenaIndex, base (hex str), poolCount}.
+
+        The response is small (~1 KB for thousands of arenas) even for large
+        processes.  Use list_pools_in_arena() for per-arena pool detail.
+        """
+        result = self._script.exports_sync.list_arenas()
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error"))
+        return list(result["arenas"])
+
+    @keke.ktrace("arena_base")
+    def list_pools_in_arena(self, arena_base: int) -> list[dict[str, Any]]:
+        """Scan one arena_size window; return pool-header dicts (no freeAddrs).
+
+        arena_base must be the arena_size-aligned address from list_arenas().
+        """
+        result = self._script.exports_sync.list_pools_in_arena(f"{arena_base:x}")
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error"))
+        return list(result["pools"])
+
+    @keke.ktrace()
+    def list_pool_subset(self, first_addr: int, half_open_last_addr: int) -> bytes:
+        """Read raw bytes for [first_addr, half_open_last_addr) from target memory.
+
+        Returns a bytes object; split by block_size to get per-block raw data.
+        Range must be <= 65536 bytes.
+        """
+        result = self._script.exports_sync.list_pool_subset(
+            f"{first_addr:x}", f"{half_open_last_addr:x}"
+        )
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error"))
+        return bytes.fromhex(result["hex"])
+
+    @keke.ktrace()
     def resolve_type_names(self, type_ptrs: list[int]) -> dict[int, str]:
         """Bulk-resolve ob_type pointer values → tp_name strings (no GIL)."""
         if not type_ptrs:
@@ -277,6 +347,7 @@ class MemWalkCollector:
         result = self._script.exports_sync.resolve_type_names(hex_list)
         return {int(k, 16): v for k, v in result.items()}
 
+    @keke.ktrace()
     def symbolize_addresses(self, ptrs: list[int]) -> dict[int, dict[str, Any] | None]:
         """Bulk-resolve addresses → {module, path, offset, symbol} or None (no GIL)."""
         if not ptrs:
@@ -291,6 +362,7 @@ class MemWalkCollector:
             self._enhance_with_debuginfod(out)
         return out
 
+    @keke.ktrace()
     def _enhance_with_debuginfod(
         self, results: dict[int, dict[str, Any] | None]
     ) -> None:
@@ -339,6 +411,7 @@ class MemWalkCollector:
         result = self._script.exports_sync.repr_block(f"{block_addr:x}")
         return str(result.get("typeName", "?"))
 
+    @keke.ktrace()
     def __exit__(self, *_: object) -> None:
         if self._script is not None:
             try:

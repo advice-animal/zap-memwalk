@@ -7,6 +7,8 @@ import json
 import sys
 from typing import TYPE_CHECKING, Any
 
+import keke
+
 if TYPE_CHECKING:
     from zap_memwalk._collector import MemWalkCollector
     from zap_memwalk._model import PoolSnapshot
@@ -152,6 +154,7 @@ def main() -> None:
         pass
 
 
+@keke.ktrace()
 def _print_text(snap: object) -> None:
     from zap_memwalk._model import MemorySnapshot  # noqa: PLC0415
 
@@ -176,6 +179,7 @@ def _print_text(snap: object) -> None:
     )
 
 
+@keke.ktrace()
 def _pool_blocks_json(
     col: "MemWalkCollector",
     pool: "PoolSnapshot",
@@ -269,4 +273,5 @@ def _pool_blocks_json(
 
 
 if __name__ == "__main__":
-    main()
+    with keke.TraceOutput(open("trace.out", "w")):
+        main()

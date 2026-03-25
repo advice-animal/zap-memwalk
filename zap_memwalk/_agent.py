@@ -153,6 +153,50 @@ function scanAllPools() {
     return pools;
 }
 
+// ── single-arena pool scan ────────────────────────────────────────────────────
+// Scans exactly one arena_size window starting at arenaBase (must be
+// arena_size-aligned).  Returns the same pool-record shape as scanAllPools()
+// but without freeAddrs.  Errors on individual pool reads are silently skipped.
+function scanOneArena(arenaBase) {
+    const POOL_SIZE     = _poolSize;
+    const POOL_MASK     = POOL_SIZE - 1;
+    const POOL_OVERHEAD = 48;
+
+    let buf;
+    try {
+        buf = ptr('0x' + arenaBase.toString(16)).readByteArray(_arenaSize);
+    } catch (e) { return []; }
+
+    const dv       = new DataView(buf);
+    const firstOff = (POOL_SIZE - (arenaBase & POOL_MASK)) & POOL_MASK;
+    const pools    = [];
+
+    for (let off = firstOff; off + POOL_SIZE <= _arenaSize; off += POOL_SIZE) {
+        const szidx = dv.getUint32(off + 36, true);
+        if (szidx >= 32) continue;
+
+        const blockSize     = (szidx + 1) * 16;
+        const maxnextoffset = dv.getUint32(off + 44, true);
+        if (maxnextoffset !== POOL_SIZE - blockSize) continue;
+
+        const refCount    = dv.getUint32(off +  0, true);
+        const nextoffset  = dv.getUint32(off + 40, true);
+        const totalBlocks = (POOL_SIZE - POOL_OVERHEAD) / blockSize;
+        if (refCount > totalBlocks || nextoffset > POOL_SIZE) continue;
+
+        const arenaIndex = dv.getUint32(off + 32, true);
+        pools.push({
+            address: (arenaBase + off).toString(16),
+            arenaIndex,
+            szidx,
+            refCount,
+            nextoffset,
+            maxnextoffset,
+        });
+    }
+    return pools;
+}
+
 // ── RPC exports ───────────────────────────────────────────────────────────────
 rpc.exports = {
 
@@ -179,6 +223,30 @@ _m._mw_pymin = _sys.version_info.minor
     collect: function () {
         try {
             return {ok: true, pools: scanAllPools()};
+        } catch (e) {
+            return {ok: false, error: e.message};
+        }
+    },
+
+    // collectFiltered: like collect() but restricted to ranges whose size is
+    // exactly a small multiple of ARENA_SIZE (the heuristic that identifies
+    // CPython mmap arenas on 64-bit systems).  One RPC call, so no per-arena
+    // round-trip overhead.  freeAddrs are omitted (deferred to readPool).
+    collectFiltered: function () {
+        const ARENA_SIZE = _arenaSize;
+        const pools = [];
+        try {
+            for (const range of Process.enumerateRanges('rw-')) {
+                if (range.size % ARENA_SIZE !== 0) continue;
+                if (range.size > 4 * ARENA_SIZE)   continue;
+                const rangeBase = parseInt(range.base.toString());
+                const count     = range.size / ARENA_SIZE;
+                for (let i = 0; i < count; i++) {
+                    for (const p of scanOneArena(rangeBase + i * ARENA_SIZE))
+                        pools.push(p);
+                }
+            }
+            return {ok: true, pools};
         } catch (e) {
             return {ok: false, error: e.message};
         }
@@ -302,6 +370,73 @@ _m._mw_pymin = _sys.version_info.minor
             return range ? range.protection : null;
         } catch (_) {
             return null;
+        }
+    },
+
+    // ── streaming collect API ─────────────────────────────────────────────────
+    // listArenas: enumerate rw- ranges of exactly ARENA_SIZE — no memory reads.
+    // CPython allocates each arena with a single mmap(NULL, ARENA_SIZE, …) call,
+    // so those regions appear as distinct ARENA_SIZE-sized rw- ranges.
+    // Adjacent arenas coalesced by the OS (size == N*ARENA_SIZE) are split.
+    // arenaIndex here is a synthetic sequence number; actual pool_header.arenaIndex
+    // values come from listPoolsInArena().
+    // NOTE: must be named listArenas (camelCase) for Frida's Python→JS mapping.
+    listArenas: function () {
+        try {
+            const ARENA_SIZE = _arenaSize;
+            const arenas = [];
+            let idx = 0;
+            for (const range of Process.enumerateRanges('rw-')) {
+                if (range.size % ARENA_SIZE !== 0) continue;
+                // Skip very large regions (heap, anonymous mmap, etc.) that
+                // happen to be a multiple of 1 MiB — arenas are never >2 MiB
+                // per individual mmap, and coalesced runs are rarely >4.
+                if (range.size > 4 * ARENA_SIZE) continue;
+                const base = parseInt(range.base.toString());
+                const count = range.size / ARENA_SIZE;
+                for (let i = 0; i < count; i++) {
+                    arenas.push({
+                        arenaIndex: idx++,
+                        base: (base + i * ARENA_SIZE).toString(16),
+                        poolCount: -1,   // filled in by listPoolsInArena
+                    });
+                }
+            }
+            return {ok: true, arenas};
+        } catch (e) {
+            return {ok: false, error: e.message};
+        }
+    },
+
+    // listPoolsInArena: scan one arena_size window, return pool headers only.
+    // arenaBaseHex must be the arena_size-aligned base returned by listArenas.
+    // NOTE: must be named listPoolsInArena (camelCase) for Frida's mapping.
+    listPoolsInArena: function (arenaBaseHex) {
+        try {
+            const arenaBase = parseInt('0x' + arenaBaseHex, 16);
+            return {ok: true, pools: scanOneArena(arenaBase)};
+        } catch (e) {
+            return {ok: false, error: e.message};
+        }
+    },
+
+    // listPoolSubset: read raw bytes for [firstAddr, halfOpenLastAddr) and return
+    // as a single hex string.  Python splits by blockSize*2 chars per block.
+    // Half-open range; size must be <= 65536 bytes.
+    // NOTE: must be named listPoolSubset (camelCase) for Frida's mapping.
+    listPoolSubset: function (firstAddrHex, halfOpenLastAddrHex) {
+        try {
+            const first = parseInt('0x' + firstAddrHex,        16);
+            const last  = parseInt('0x' + halfOpenLastAddrHex, 16);
+            const size  = last - first;
+            if (size <= 0 || size > 65536)
+                return {ok: false, error: 'range out of bounds: ' + size};
+            const buf = ptr('0x' + firstAddrHex).readByteArray(size);
+            const hex = Array.from(new Uint8Array(buf),
+                            b => b.toString(16).padStart(2, '0')).join('');
+            return {ok: true, hex};
+        } catch (e) {
+            return {ok: false, error: e.message};
         }
     },
 
