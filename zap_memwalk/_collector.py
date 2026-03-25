@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import shutil
 import struct
@@ -117,42 +118,49 @@ def _parse(
     py_version: tuple[int, int],
 ) -> MemorySnapshot:
     """Convert raw pool dicts from the JS agent into a MemorySnapshot."""
-    # Build a SizeClassSummary for each size class (0-31)
-    buckets: list[list[PoolSnapshot]] = [[] for _ in range(_NUM_SIZE_CLASSES)]
+    # Disable GC for the duration: allocating ~100k PoolSnapshot objects would
+    # otherwise trigger ~140 gen0 sweeps mid-loop (threshold=700).  There are
+    # no reference cycles in these objects, so refcount frees them when the old
+    # snapshot is replaced; GC only wastes time traversing them.
+    gc.disable()
+    try:
+        buckets: list[list[PoolSnapshot]] = [[] for _ in range(_NUM_SIZE_CLASSES)]
 
-    for p in raw_pools:
-        szidx = p["szidx"]
-        if szidx >= _NUM_SIZE_CLASSES:
-            continue
-        block_size = (szidx + 1) * 16
-        addr = int(p["address"], 16)
-        _free = p.get("freeAddrs") or []
-        free_addresses = frozenset(int(a, 16) for a in _free) if _free else frozenset()
-        snap = PoolSnapshot(
-            address=addr,
-            arena_index=p["arenaIndex"],
-            szidx=szidx,
-            block_size=block_size,
-            ref_count=p["refCount"],
-            nextoffset=p["nextoffset"],
-            maxnextoffset=p["maxnextoffset"],
-            free_addresses=free_addresses,
+        for p in raw_pools:
+            szidx = p["szidx"]
+            if szidx >= _NUM_SIZE_CLASSES:
+                continue
+            block_size = (szidx + 1) * 16
+            addr = int(p["address"], 16)
+            _free = p.get("freeAddrs") or []
+            free_addresses = frozenset(int(a, 16) for a in _free) if _free else frozenset()
+            snap = PoolSnapshot(
+                address=addr,
+                arena_index=p["arenaIndex"],
+                szidx=szidx,
+                block_size=block_size,
+                ref_count=p["refCount"],
+                nextoffset=p["nextoffset"],
+                maxnextoffset=p["maxnextoffset"],
+                free_addresses=free_addresses,
+            )
+            buckets[szidx].append(snap)
+
+        size_classes = [
+            SizeClassSummary(szidx=i, block_size=(i + 1) * 16, pools=buckets[i])
+            for i in range(_NUM_SIZE_CLASSES)
+        ]
+
+        return MemorySnapshot(
+            pid=pid,
+            ts=ts,
+            pool_size=pool_size,
+            arena_size=arena_size,
+            py_version=py_version,
+            size_classes=size_classes,
         )
-        buckets[szidx].append(snap)
-
-    size_classes = [
-        SizeClassSummary(szidx=i, block_size=(i + 1) * 16, pools=buckets[i])
-        for i in range(_NUM_SIZE_CLASSES)
-    ]
-
-    return MemorySnapshot(
-        pid=pid,
-        ts=ts,
-        pool_size=pool_size,
-        arena_size=arena_size,
-        py_version=py_version,
-        size_classes=size_classes,
-    )
+    finally:
+        gc.enable()
 
 
 class MemWalkCollector:
@@ -216,15 +224,16 @@ class MemWalkCollector:
 
     @keke.ktrace()
     def collect_streaming(self) -> MemorySnapshot:
-        """Filtered single-call collect: scans only 1 MiB rw- ranges.
+        """Full pool scan via scanAllPools — same as collect() but explicit.
 
-        Uses the ARENA_SIZE size heuristic + a 48-byte probe to skip non-arena
-        regions before reading each arena in full.  One Frida RPC call, so no
-        per-arena round-trip overhead.  Returns the same MemorySnapshot as
-        collect().
+        scanAllPools scans at pool_size granularity so it correctly finds pools
+        regardless of how the OS lays out arena VMAs (including Linux coalescing
+        arenas with adjacent allocations into larger regions).  freeAddrs are
+        deferred to readPool() so the response stays well under the D-Bus 128 MiB
+        limit even for very large processes.
         """
-        with keke.kev("exports_sync.collectFiltered"):
-            result = self._script.exports_sync.collect_filtered()
+        with keke.kev("exports_sync.collect"):
+            result = self._script.exports_sync.collect()
         if not result.get("ok"):
             raise RuntimeError(result.get("error"))
         return _parse(

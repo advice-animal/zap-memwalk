@@ -237,10 +237,13 @@ _m._mw_pymin = _sys.version_info.minor
         const pools = [];
         try {
             for (const range of Process.enumerateRanges('rw-')) {
-                if (range.size % ARENA_SIZE !== 0) continue;
-                if (range.size > 4 * ARENA_SIZE)   continue;
+                if (range.size < ARENA_SIZE) continue;
+                // Use floor division so that a run of N arenas that got merged
+                // with a small adjacent allocation (e.g. 3 MiB + 4 KiB) is still
+                // fully scanned.  Any sub-ARENA_SIZE residual at the end is
+                // ignored — it can't contain a complete pool.
                 const rangeBase = parseInt(range.base.toString());
-                const count     = range.size / ARENA_SIZE;
+                const count     = Math.floor(range.size / ARENA_SIZE);
                 for (let i = 0; i < count; i++) {
                     for (const p of scanOneArena(rangeBase + i * ARENA_SIZE))
                         pools.push(p);
@@ -387,13 +390,9 @@ _m._mw_pymin = _sys.version_info.minor
             const arenas = [];
             let idx = 0;
             for (const range of Process.enumerateRanges('rw-')) {
-                if (range.size % ARENA_SIZE !== 0) continue;
-                // Skip very large regions (heap, anonymous mmap, etc.) that
-                // happen to be a multiple of 1 MiB — arenas are never >2 MiB
-                // per individual mmap, and coalesced runs are rarely >4.
-                if (range.size > 4 * ARENA_SIZE) continue;
-                const base = parseInt(range.base.toString());
-                const count = range.size / ARENA_SIZE;
+                if (range.size < ARENA_SIZE) continue;
+                const base  = parseInt(range.base.toString());
+                const count = Math.floor(range.size / ARENA_SIZE);
                 for (let i = 0; i < count; i++) {
                     arenas.push({
                         arenaIndex: idx++,

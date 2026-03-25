@@ -124,6 +124,7 @@ class MemWalkTUI:
         self._col = collector
         self._interval = interval
         self._snap: MemorySnapshot | None = None
+        self._refresh_parity: bool = False  # toggled after each completed refresh
         # Prevents concurrent Frida RPC from the background refresh thread and
         # an explicit 'R' keypress.  Background thread uses acquire(blocking=False)
         # to skip a cycle if a manual refresh is already in progress.
@@ -441,8 +442,11 @@ class MemWalkTUI:
                 second_line = f"{base}  [lookups: {self._rpc_lookups}]"
             else:
                 second_line = base
+        dot = ("·", "green") if self._refresh_parity else ("·", "dim")
         return Text.assemble(
             ("zap-memwalk", "bold"),
+            " ",
+            dot,
             "  ",
             (pid_info, "cyan"),
             "  ",
@@ -740,6 +744,7 @@ class MemWalkTUI:
     def _refresh_full(self) -> None:
         """Full arena scan — used for size-class and pool views."""
         self._snap = self._col.collect_streaming()
+        self._refresh_parity = not self._refresh_parity
 
     @keke.ktrace()
     def _refresh_block_view(self) -> None:
