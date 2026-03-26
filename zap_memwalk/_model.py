@@ -28,8 +28,8 @@ class PoolSnapshot:
 
     @property
     def pool_size(self) -> int:
-        # Derived from maxnextoffset: maxnextoffset = pool_size - POOL_OVERHEAD - block_size
-        return self.maxnextoffset + POOL_OVERHEAD + self.block_size
+        # CPython invariant: maxnextoffset = POOL_SIZE - block_size
+        return self.maxnextoffset + self.block_size
 
     @property
     def total_blocks(self) -> int:

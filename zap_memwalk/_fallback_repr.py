@@ -53,11 +53,15 @@ def fallback_repr_from_raw(
                 end = data_off + length
                 if end <= len(blk_bytes):
                     payload = blk_bytes[data_off:end]
-                    # Null bytes mean we hit the wstr pointer slot (≤3.11) — skip.
-                    if b"\x00" not in payload and all(b < 128 for b in payload):
-                        return "(freed) " + repr(
-                            payload.decode("ascii", errors="replace")
-                        )
+                    # Strip trailing nulls (null terminator / alignment padding).
+                    # Non-trailing nulls mean we hit the wstr pointer slot (≤3.11) — skip.
+                    stripped = payload.rstrip(b"\x00")
+                    if not stripped:
+                        continue
+                    if b"\x00" in stripped:
+                        continue
+                    if all(b < 128 for b in stripped):
+                        return repr(stripped.decode("ascii", errors="replace"))
             return None
         elif type_name == "bytes":
             if len(blk_bytes) < 33:
@@ -65,12 +69,12 @@ def fallback_repr_from_raw(
             ob_size = _s.unpack_from("<q", blk_bytes, 16)[0]
             if not (0 <= ob_size <= len(blk_bytes) - 32):
                 return None
-            return "(freed) " + repr(bytes(blk_bytes[32 : 32 + ob_size]))
+            return repr(bytes(blk_bytes[32 : 32 + ob_size]))
         elif type_name == "float":
             if len(blk_bytes) < 24:
                 return None
             val = _s.unpack_from("<d", blk_bytes, 16)[0]
-            return f"(freed) {val!r}"
+            return repr(val)
         elif type_name == "int":
             if len(blk_bytes) < 28:
                 return None
@@ -79,52 +83,71 @@ def fallback_repr_from_raw(
                 # compact = lv_tag < 16; digit at +24
                 lv_tag = _s.unpack_from("<Q", blk_bytes, 16)[0]
                 if lv_tag == 1:  # SIGN_ZERO
-                    return "(freed) 0"
+                    return "0"
                 if lv_tag < 16:  # compact single-digit
                     digit = _s.unpack_from("<I", blk_bytes, 24)[0]
                     sign = -1 if (lv_tag & 2) else 1
-                    return f"(freed) {sign * digit}"
+                    return str(sign * digit)
                 ndigits = lv_tag >> 3
+                sign = -1 if (lv_tag & 2) else 1
+                if ndigits == 2 and len(blk_bytes) >= 32:
+                    d0 = _s.unpack_from("<I", blk_bytes, 24)[0]
+                    d1 = _s.unpack_from("<I", blk_bytes, 28)[0]
+                    return str(sign * (d0 + d1 * (1 << 30)))
                 if 0 < ndigits <= 10000:
-                    return f"(freed) int ({ndigits}-digit)"
+                    return f"int ({ndigits}-digit)"
                 return None
             else:
                 # 3.10-3.11: ob_size is signed; abs = ndigits, sign = sign of value
                 ob_size = _s.unpack_from("<q", blk_bytes, 16)[0]
                 if ob_size == 0:
-                    return "(freed) 0"
+                    return "0"
                 n = abs(ob_size)
-                if n <= 10000:
-                    if n == 1:
-                        digit = _s.unpack_from("<I", blk_bytes, 24)[0]
-                        return f"(freed) {-digit if ob_size < 0 else digit}"
-                    return f"(freed) int ({n}-digit)"
+                if n == 1 and len(blk_bytes) >= 28:
+                    digit = _s.unpack_from("<I", blk_bytes, 24)[0]
+                    return str(-digit if ob_size < 0 else digit)
+                if n == 2 and len(blk_bytes) >= 32:
+                    d0 = _s.unpack_from("<I", blk_bytes, 24)[0]
+                    d1 = _s.unpack_from("<I", blk_bytes, 28)[0]
+                    value = d0 + d1 * (1 << 30)
+                    return str(-value if ob_size < 0 else value)
+                if 0 < n <= 10000:
+                    return f"int ({n}-digit)"
                 return None
         elif type_name in ("list", "tuple"):
             if len(blk_bytes) < _GC + 24:
                 return None
             ob_size = _s.unpack_from("<q", blk_bytes, _GC + 16)[0]
             if 0 <= ob_size <= 10**8:
-                return f"(freed) {type_name}[{ob_size}]"
+                return f"{type_name}[{ob_size}]"
             return None
         elif type_name == "dict":
             if len(blk_bytes) < _GC + 24:
                 return None
             ma_used = _s.unpack_from("<q", blk_bytes, _GC + 16)[0]
             if 0 <= ma_used <= 10**8:
-                return f"(freed) dict{{{ma_used}}}"
+                return f"dict{{{ma_used}}}"
             return None
         elif type_name in ("set", "frozenset"):
             if len(blk_bytes) < _GC + 32:
                 return None
             used = _s.unpack_from("<q", blk_bytes, _GC + 24)[0]
             if 0 <= used <= 10**8:
-                return f"(freed) {type_name}{{{used}}}"
+                return f"{type_name}{{{used}}}"
             return None
+        elif type_name == "code":
+            # GC-tracked in 3.10-3.12; not GC-tracked in 3.13+.
+            # co_name and co_filename are pointers (can't dereference here).
+            # For 3.10-, co_argcount (i32) is at block+32 (after 16-byte GC header) and is often readable.
+            if py_version < (3, 11) and len(blk_bytes) >= 36:
+                co_argcount = _s.unpack_from("<i", blk_bytes, 32)[0]
+                if 0 <= co_argcount <= 255:
+                    return f"(code, {co_argcount} args)"
+            return "(code object)"
         elif type_name == "frame":
-            return "(freed frame)"
+            return "(frame)"
         elif type_name == "module":
-            return "(freed module)"
+            return "(module)"
     except Exception:
         pass
     return None

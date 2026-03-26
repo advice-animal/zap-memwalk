@@ -110,10 +110,13 @@ class TestReprBlock:
 
     @frida_mark
     def test_repr_implausible_addr_returns_none(self, idle_proc):
-        """repr_block on address 0x1 should not crash; returns None."""
+        """repr_block on address 0x1 should not crash; returns (None, error_msg)."""
         with MemWalkCollector(idle_proc.pid) as col:
             result = col.repr_block(0x1)
-        assert result is None
+        assert result is not None
+        type_name, err_msg = result
+        assert type_name is None
+        assert err_msg
 
 
 class TestReadPool:

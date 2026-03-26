@@ -133,7 +133,9 @@ def _parse(
             block_size = (szidx + 1) * 16
             addr = int(p["address"], 16)
             _free = p.get("freeAddrs") or []
-            free_addresses = frozenset(int(a, 16) for a in _free) if _free else frozenset()
+            free_addresses = (
+                frozenset(int(a, 16) for a in _free) if _free else frozenset()
+            )
             snap = PoolSnapshot(
                 address=addr,
                 arena_index=p["arenaIndex"],
@@ -296,18 +298,53 @@ class MemWalkCollector:
         )
 
     @keke.ktrace("block_addr")
-    def repr_block(self, block_addr: int) -> tuple[str, str] | None:
-        """Safely repr a live block; returns (type_name, repr_str) or None.
+    def repr_block(self, block_addr: int) -> tuple[str, str] | tuple[None, str] | None:
+        """Safely repr a live block.
 
-        Bumps the refcount before calling PyObject_Repr to guard against GC.
-        Returns None if the repr fails (block freed, repr raised, etc.).
-        The type_name is always populated even on failure.
+        Returns:
+          (type_name, repr_str)  on success
+          (None, error_msg)      on failure (error_msg from JS)
+          None                   if the RPC call itself fails
         """
-        result = self._script.exports_sync.repr_block(f"{block_addr:x}")
+        try:
+            result = self._script.exports_sync.repr_block(f"{block_addr:x}")
+        except Exception as e:
+            return None, str(e)
         if result.get("ok"):
             return result["typeName"], result["reprStr"]
-        # On failure still return typeName so the TUI can show it
+        err = result.get("error") or "repr failed"
+        return None, err
+
+    def incref(self, obj_addr: int) -> str | None:
+        """Increment the refcount of a live PyObject via Py_IncRef.
+
+        Safe for immortal objects (CPython 3.12+): Py_IncRef is a no-op for
+        ob_refcnt >= _Py_IMMORTAL_REFCNT.  Only call this on live non-cstr blocks.
+        Returns None on success, or an error string if the block was rejected.
+        """
+        result = self._script.exports_sync.incref_block(f"{obj_addr:x}")
+        if not result.get("ok"):
+            return result.get("error") or "incref failed"
         return None
+
+    def decref(self, obj_addr: int) -> None:
+        """Decrement the refcount of a PyObject previously pinned by incref.
+
+        Safe for immortal objects: Py_DecRef is a no-op for immortal refcounts.
+        """
+        self._script.exports_sync.decref_block(f"{obj_addr:x}")
+
+    def ping_gil(self) -> bool:
+        """Acquire and immediately release the GIL; return True on success.
+
+        Used as a heartbeat: if the target's GIL is stuck this call blocks.
+        Returns False if the RPC call fails for any reason.
+        """
+        try:
+            result = self._script.exports_sync.ping_gil()
+            return bool(result.get("ok"))
+        except Exception:
+            return False
 
     @keke.ktrace()
     def list_arenas(self) -> list[dict[str, Any]]:
@@ -370,6 +407,18 @@ class MemWalkCollector:
         if self._debuginfod != "false":
             self._enhance_with_debuginfod(out)
         return out
+
+    @keke.ktrace()
+    def peek_cstrings(
+        self, ptrs: list[int], max_len: int = 64, min_len: int = 4
+    ) -> dict[int, str | None]:
+        """Peek at addresses for null-terminated printable ASCII strings (no GIL)."""
+        if not ptrs:
+            return {}
+        unique = list({p for p in ptrs if p})
+        hex_list = [f"{p:x}" for p in unique]
+        result = self._script.exports_sync.peek_cstrings(hex_list, max_len, min_len)
+        return {int(k, 16): (v if v else None) for k, v in result.items()}
 
     @keke.ktrace()
     def _enhance_with_debuginfod(

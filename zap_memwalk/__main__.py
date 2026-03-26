@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import signal
+import subprocess
 import sys
 from typing import TYPE_CHECKING, Any
 
+import frida
 import keke
 
 if TYPE_CHECKING:
@@ -14,12 +19,97 @@ if TYPE_CHECKING:
     from zap_memwalk._model import PoolSnapshot
 
 
+# ── helpful error messages ─────────────────────────────────────────────────────
+
+
+def _ptrace_scope() -> int | None:
+    try:
+        with open("/proc/sys/kernel/yama/ptrace_scope") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _explain_attach_failure(pid: int) -> str:
+    scope = _ptrace_scope()
+    euid = os.geteuid()
+    lines = [f"Could not attach to PID {pid}."]
+    if scope is not None and scope != 0:
+        lines.append(
+            f"  /proc/sys/kernel/yama/ptrace_scope is {scope} (not 0),"
+            " which restricts ptrace to privileged processes."
+        )
+    if euid != 0:
+        lines.append(f"  Running as euid {euid} (not root).")
+    if scope is not None and scope != 0 and euid != 0:
+        lines.append(
+            "Fix: run with sudo, or:"
+            " echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope"
+        )
+    elif euid != 0:
+        lines.append("Try running with sudo.")
+    return "\n".join(lines)
+
+
+def _explain_codesign_failure(program: str) -> str:
+    lines = [
+        f"Permission denied: cannot attach to {program!r}.",
+        "",
+        "On macOS, system-signed binaries (e.g. /usr/bin/python3) have the hardened",
+        "runtime enabled, which blocks Frida from injecting code.",
+        "",
+        "Use a non-system Python instead:",
+        "  uv python install 3.x  →  zap-memwalk $(uv python find 3.x)",
+    ]
+    return "\n".join(lines)
+
+
+def _resolve_program(name: str) -> str:
+    """Return an absolute path for *name*, searching PATH if needed."""
+    if os.sep in name or (os.altsep and os.altsep in name):
+        return name
+    resolved = shutil.which(name)
+    if resolved is None:
+        print(f"zap-memwalk: command not found: {name}", file=sys.stderr)
+        sys.exit(1)
+    return resolved
+
+
+def _teardown_proc(proc: subprocess.Popen[bytes]) -> None:
+    """Close stdin and wait for the spawned child to exit, escalating if needed."""
+    try:
+        if proc.stdin is not None:
+            proc.stdin.close()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=2.0)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+# ── argument parsing ───────────────────────────────────────────────────────────
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         prog="zap-memwalk",
         description="Interactively walk CPython pymalloc arenas in a live process.",
     )
-    ap.add_argument("pid", type=int, help="target process PID")
+    ap.add_argument(
+        "-p",
+        dest="pid",
+        type=int,
+        metavar="PID",
+        help="attach to an already-running process by PID",
+    )
     ap.add_argument(
         "--interval",
         "-i",
@@ -68,14 +158,48 @@ def main() -> None:
         metavar="FILE",
         help="write a Chrome-trace (keke) JSON to FILE",
     )
+    # REMAINDER collects everything from the first positional onward without
+    # interpreting flags, so `zap-memwalk python -c 'stmt'` works as expected.
+    ap.add_argument(
+        "argv",
+        nargs=argparse.REMAINDER,
+        metavar="PROGRAM [ARG ...]",
+        help="spawn this program (with optional arguments) and attach to it",
+    )
     args = ap.parse_args()
+
+    if args.pid is not None and args.argv:
+        ap.error("specify either -p PID or PROGRAM [ARG ...], not both")
+    if args.pid is None and not args.argv:
+        ap.error("one of -p PID or PROGRAM [ARG ...] is required")
+
+    proc: subprocess.Popen[bytes] | None = None
+
+    if args.pid is not None:
+        pid = args.pid
+    else:
+        argv = [_resolve_program(args.argv[0])] + args.argv[1:]
+        try:
+            # stdin=PIPE: hold the write end open so the spawned process doesn't
+            # see EOF immediately.  Closing proc.stdin on exit lets it exit cleanly.
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE)
+        except PermissionError:
+            if sys.platform == "darwin":
+                print(_explain_codesign_failure(argv[0]), file=sys.stderr)
+            else:
+                print(f"Permission denied spawning {argv[0]!r}.", file=sys.stderr)
+            sys.exit(1)
+        except FileNotFoundError:
+            print(f"zap-memwalk: command not found: {argv[0]}", file=sys.stderr)
+            sys.exit(1)
+        pid = proc.pid
 
     from zap_memwalk._collector import MemWalkCollector  # noqa: PLC0415
     from zap_memwalk._tui import MemWalkTUI  # noqa: PLC0415
 
     with keke.TraceOutput(file=args.trace):
         try:
-            with MemWalkCollector(args.pid, debuginfod=args.debuginfod) as col:
+            with MemWalkCollector(pid, debuginfod=args.debuginfod) as col:
                 if args.json:
                     snap = col.collect()
                     print(json.dumps(snap.to_dict(), indent=2))
@@ -134,7 +258,10 @@ def main() -> None:
                             pass
                         print(
                             json.dumps(
-                                {"error": "not in any pymalloc pool", "symbol": sym_label}
+                                {
+                                    "error": "not in any pymalloc pool",
+                                    "symbol": sym_label,
+                                }
                             )
                         )
                         return
@@ -154,11 +281,37 @@ def main() -> None:
                     print(json.dumps(match, indent=2))
                     return
                 MemWalkTUI(col, interval=args.interval).run()
+        except frida.PermissionDeniedError as exc:
+            _frida_permission_error(pid, args, exc)
+            sys.exit(1)
+        except frida.ProcessNotFoundError:
+            # On Linux, ptrace_scope=1 causes ptrace(PTRACE_ATTACH) to fail
+            # with EPERM; Frida surfaces this as ProcessNotFoundError rather
+            # than PermissionDeniedError.  Distinguish by checking /proc.
+            if sys.platform == "linux" and os.path.isdir(f"/proc/{pid}"):
+                print(_explain_attach_failure(pid), file=sys.stderr)
+            else:
+                print(f"No process with PID {pid} found.", file=sys.stderr)
+            sys.exit(1)
         except RuntimeError as exc:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(1)
         except KeyboardInterrupt:
             pass
+        finally:
+            if proc is not None:
+                _teardown_proc(proc)
+
+
+def _frida_permission_error(pid: int, args: argparse.Namespace, exc: Exception) -> None:
+
+    if sys.platform == "linux":
+        print(_explain_attach_failure(pid), file=sys.stderr)
+    elif sys.platform == "darwin":
+        program = args.argv[0] if args.argv else str(pid)
+        print(_explain_codesign_failure(program), file=sys.stderr)
+    else:
+        print(f"Permission denied attaching to PID {pid}: {exc}.", file=sys.stderr)
 
 
 @keke.ktrace()
@@ -196,12 +349,15 @@ def _pool_blocks_json(
     import struct
 
     from zap_memwalk._model import POOL_OVERHEAD  # noqa: PLC0415
+    from zap_memwalk._tui import _augmented_free_set  # noqa: PLC0415
 
     raw = bytes(pool_raw.get("raw", b"") or b"")
     szidx = pool_raw.get("szidx", pool.szidx)
     block_size = (szidx + 1) * 16
     nextoffset = pool_raw.get("nextoffset", pool.nextoffset)
-    free_set = frozenset(int(a, 16) for a in pool_raw.get("freeAddrs", []))
+    free_set = _augmented_free_set(
+        raw, pool.address, block_size, nextoffset, pool_raw.get("freeAddrs", [])
+    )
 
     # First pass: collect blocks and candidate ob_type pointers for batch RPC.
     # GC-tracked objects (dict, list, etc.) have a 16-byte PyGC_Head before the

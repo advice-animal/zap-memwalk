@@ -19,7 +19,7 @@ def _make_pool(
     szidx: int = 1,
     ref_count: int = 100,
     nextoffset: int = 3248,  # some bytes into pool
-    maxnextoffset: int = 16320,
+    maxnextoffset: int = 16352,  # POOL_SIZE(16384) - block_size(32) for szidx=1
     free_addresses: frozenset[int] = frozenset(),
 ) -> PoolSnapshot:
     block_size = (szidx + 1) * 16
@@ -37,18 +37,18 @@ def _make_pool(
 
 class TestPoolSnapshot:
     def test_pool_size_derived_from_maxnextoffset(self):
-        # pool_size = maxnextoffset + POOL_OVERHEAD + block_size = 16320 + 48 + 32 = 16400
-        # but canonical is 16384; maxnextoffset = 16384 - 48 - 32 = 16304
-        pool2 = _make_pool(szidx=1, maxnextoffset=16304)
+        # CPython invariant: maxnextoffset = POOL_SIZE - block_size
+        # For szidx=1 (block_size=32): maxnextoffset = 16384 - 32 = 16352
+        pool2 = _make_pool(szidx=1, maxnextoffset=16352)
         assert pool2.pool_size == 16384
 
     def test_total_blocks(self):
-        pool = _make_pool(szidx=1, maxnextoffset=16304)
+        pool = _make_pool(szidx=1, maxnextoffset=16352)
         # (16384 - 48) // 32 = 510
         assert pool.total_blocks == 510
 
     def test_fill_pct(self):
-        pool = _make_pool(szidx=1, ref_count=255, maxnextoffset=16304)
+        pool = _make_pool(szidx=1, ref_count=255, maxnextoffset=16352)
         assert abs(pool.fill_pct - 255 / 510 * 100) < 0.01
 
     def test_fill_pct_zero_when_no_blocks(self):
@@ -78,8 +78,8 @@ class TestPoolSnapshot:
         assert pool.block_state(addr) == BlockState.UNBORN
 
     def test_iter_block_addresses(self):
-        pool = _make_pool(address=0x1000_0000, szidx=0, maxnextoffset=16320)
-        # block_size = 16; pool_size = 16320 + 48 + 16 = 16384
+        pool = _make_pool(address=0x1000_0000, szidx=0, maxnextoffset=16368)
+        # block_size = 16; pool_size = maxnextoffset + block_size = 16368 + 16 = 16384
         addrs = pool.iter_block_addresses()
         assert addrs[0] == 0x1000_0000 + 48
         assert (addrs[1] - addrs[0]) == 16
@@ -87,8 +87,8 @@ class TestPoolSnapshot:
 
 class TestSizeClassSummary:
     def test_aggregation(self):
-        p1 = _make_pool(ref_count=100, maxnextoffset=16304)
-        p2 = _make_pool(ref_count=200, maxnextoffset=16304)
+        p1 = _make_pool(ref_count=100, maxnextoffset=16352)
+        p2 = _make_pool(ref_count=200, maxnextoffset=16352)
         sc = SizeClassSummary(szidx=1, block_size=32, pools=[p1, p2])
         assert sc.pool_count == 2
         assert sc.used_blocks == 300

@@ -306,10 +306,15 @@ _m._mw_pymin = _sys.version_info.minor
             } catch (_) {}
         }
 
+        // ob_refcnt is Py_ssize_t (int64).  Read the low 32 bits; that is sufficient for
+        // normal objects (refcount fits in 32 bits) and for immortal objects in CPython 3.12+
+        // where _Py_IMMORTAL_REFCNT = 0xFFFFFFFF.  The old upper-bound check (> 0x7fffffff)
+        // incorrectly rejected immortal objects, so we now only reject refcount == 0.
+        // ob_type validation above already provides sufficient liveness checking.
         let refcnt = 0;
         try { refcnt = objPtr.add(0).readU32(); } catch (_) {}
-        if (refcnt === 0 || refcnt > 0x7fffffff) {
-            return {ok: false, typeName, error: 'implausible refcount — block may be free'};
+        if (refcnt === 0) {
+            return {ok: false, typeName, error: 'zero refcount — block may be free'};
         }
 
         const ensure   = nfn('PyGILState_Ensure',  'int',     []);
@@ -344,6 +349,76 @@ _m._mw_pymin = _sys.version_info.minor
         return reprStr !== null
             ? {ok: true, typeName, reprStr}
             : {ok: false, typeName, error: errMsg || 'repr failed'};
+    },
+
+    // Increment the refcount of a live PyObject.  Always calls Py_IncRef (the
+    // exported C function) rather than doing raw arithmetic so that immortal
+    // objects (ob_refcnt == _Py_IMMORTAL_REFCNT) are handled safely.
+    // PyGILState_Ensure/Release wrap the call so it is safe to invoke from any
+    // thread, including Frida's RPC thread which does not hold the GIL.
+    // NOTE: must be named increfBlock (camelCase) for Frida's Python→JS mapping.
+    increfBlock: function (objAddrHex) {
+        try {
+            const objPtr = ptr('0x' + objAddrHex);
+            // Safety: read ob_refcnt (low 32 bits) before touching the GIL.
+            // A value > 1000 that isn't _Py_IMMORTAL_REFCNT (0xFFFFFFFF) almost
+            // certainly means this isn't a real PyObject — bail out rather than
+            // corrupting a live process by incref-ing a non-object.
+            const rc = objPtr.readU32();
+            if (rc > 1000 && rc !== 0xFFFFFFFF) {
+                return {ok: false, error: `implausible refcount 0x${rc.toString(16)} — not a PyObject`};
+            }
+            const ensure = nfn('PyGILState_Ensure',  'int',  []);
+            const release = nfn('PyGILState_Release', 'void', ['int']);
+            const incRef  = nfn('Py_IncRef', 'void', ['pointer']);
+            const state = ensure();
+            try {
+                incRef(objPtr);
+            } finally {
+                release(state);
+            }
+            return {ok: true};
+        } catch (e) {
+            return {ok: false, error: e.message};
+        }
+    },
+
+    // Acquire the GIL and immediately release it; returns {ok:true} on success.
+    // Used as a heartbeat: if the GIL is stuck this call blocks and the TUI dot
+    // stops toggling, giving the earliest possible deadlock indication.
+    // NOTE: must be named pingGil (camelCase) for Frida's Python→JS mapping.
+    pingGil: function () {
+        try {
+            const ensure  = nfn('PyGILState_Ensure',  'int',  []);
+            const release = nfn('PyGILState_Release', 'void', ['int']);
+            const state = ensure();
+            release(state);
+            return {ok: true};
+        } catch (e) {
+            return {ok: false, error: e.message};
+        }
+    },
+
+    // Decrement the refcount of a PyObject previously incremented by increfBlock.
+    // Always calls Py_DecRef so immortal objects are handled safely.
+    // PyGILState_Ensure/Release wrap the call: Py_DecRef can trigger _Py_Dealloc
+    // if the refcount reaches zero, which requires the GIL.
+    // NOTE: must be named decrefBlock (camelCase) for Frida's Python→JS mapping.
+    decrefBlock: function (objAddrHex) {
+        try {
+            const ensure  = nfn('PyGILState_Ensure',  'int',  []);
+            const release = nfn('PyGILState_Release', 'void', ['int']);
+            const decRef  = nfn('Py_DecRef', 'void', ['pointer']);
+            const state = ensure();
+            try {
+                decRef(ptr('0x' + objAddrHex));
+            } finally {
+                release(state);
+            }
+            return {ok: true};
+        } catch (e) {
+            return {ok: false, error: e.message};
+        }
     },
 
     // Bulk-resolve ob_type pointers → tp_name strings (no GIL needed).
@@ -439,6 +514,35 @@ _m._mw_pymin = _sys.version_info.minor
         }
     },
 
+    // Peek at potential C-string content at the given addresses.
+    // For each address, reads up to maxLen bytes and returns the content
+    // as a string if it starts with a null-terminated printable ASCII sequence
+    // of at least minLen chars, else null.
+    // NOTE: must be named peekCStrings (camelCase) for Frida's Python→JS mapping.
+    peekCStrings: function(addrHexList, maxLen, minLen) {
+        maxLen = maxLen || 64;
+        minLen = minLen || 4;
+        const result = {};
+        for (const addrHex of addrHexList) {
+            try {
+                const buf = ptr('0x' + addrHex).readByteArray(maxLen);
+                const bytes = new Uint8Array(buf);
+                let end = -1;
+                for (let i = 0; i < bytes.length; i++) {
+                    const b = bytes[i];
+                    if (b === 0) { end = i; break; }
+                    if (b < 0x20 || b > 0x7E) { break; }
+                }
+                result[addrHex] = (end >= minLen)
+                    ? String.fromCharCode.apply(null, bytes.subarray(0, end))
+                    : null;
+            } catch (_) {
+                result[addrHex] = null;
+            }
+        }
+        return result;
+    },
+
     // Bulk-resolve addresses → {module, offset, symbol} or null.
     // Uses Process.findModuleByAddress (no GIL, cross-platform) for module lookup
     // and DebugSymbol.fromAddress (best-effort) for symbol names.
@@ -465,7 +569,20 @@ _m._mw_pymin = _sys.version_info.minor
                 const symbolName = (rawName.length > 0 && !rawName.startsWith('0x'))
                     ? rawName : null;
 
-                result[addrHex] = { module: modName, path: mod ? mod.path : '', offset: offset, symbol: symbolName };
+                // Compute byte offset from the symbol's own base address.
+                // DebugSymbol.fromAddress(p).address is always p itself (queried address),
+                // not the symbol's base — so we resolve the symbol's address separately.
+                let symbolOffset = 0;
+                if (symbolName) {
+                    try {
+                        const symBase = Module.findExportByName(modName, symbolName);
+                        if (symBase && !symBase.isNull()) {
+                            symbolOffset = parseInt(p.sub(symBase).toString());
+                        }
+                    } catch (_) {}
+                }
+
+                result[addrHex] = { module: modName, path: mod ? mod.path : '', offset: offset, symbol: symbolName, symbolOffset: symbolOffset };
             } catch (_) {
                 result[addrHex] = null;
             }

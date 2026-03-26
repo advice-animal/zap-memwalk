@@ -34,7 +34,7 @@ class TestFallbackStr:
 
     def test_ascii_at_offset_40(self):
         blk = self._make("hello", data_off=40)
-        assert fallback_repr_from_raw(blk, "str") == "(freed) 'hello'"
+        assert fallback_repr_from_raw(blk, "str") == "'hello'"
 
     def test_ascii_at_offset_48(self):
         """Offset 40 contains null bytes (wstr ptr) so we fall through to offset 48."""
@@ -44,7 +44,7 @@ class TestFallbackStr:
         struct.pack_into("<I", buf, 32, 0x60)
         # offset 40–47: leave as zero (null bytes → skip)
         buf[48 : 48 + n] = b"abc"
-        assert fallback_repr_from_raw(bytes(buf), "str") == "(freed) 'abc'"
+        assert fallback_repr_from_raw(bytes(buf), "str") == "'abc'"
 
     def test_too_short_returns_none(self):
         assert fallback_repr_from_raw(b"\x00" * 30, "str") is None
@@ -84,12 +84,12 @@ class TestFallbackBytes:
         buf = _buf(48)
         struct.pack_into("<q", buf, 16, 5)  # ob_size = 5
         buf[32:37] = b"hello"
-        assert fallback_repr_from_raw(bytes(buf), "bytes") == "(freed) b'hello'"
+        assert fallback_repr_from_raw(bytes(buf), "bytes") == "b'hello'"
 
     def test_empty_bytes(self):
         buf = _buf(48)
         struct.pack_into("<q", buf, 16, 0)
-        assert fallback_repr_from_raw(bytes(buf), "bytes") == "(freed) b''"
+        assert fallback_repr_from_raw(bytes(buf), "bytes") == "b''"
 
     def test_too_short_returns_none(self):
         assert fallback_repr_from_raw(b"\x00" * 20, "bytes") is None
@@ -112,12 +112,12 @@ class TestFallbackFloat:
     def test_positive(self):
         buf = _buf(32)
         struct.pack_into("<d", buf, 16, 3.14)
-        assert fallback_repr_from_raw(bytes(buf), "float") == "(freed) 3.14"
+        assert fallback_repr_from_raw(bytes(buf), "float") == "3.14"
 
     def test_negative(self):
         buf = _buf(32)
         struct.pack_into("<d", buf, 16, -2.5)
-        assert fallback_repr_from_raw(bytes(buf), "float") == "(freed) -2.5"
+        assert fallback_repr_from_raw(bytes(buf), "float") == "-2.5"
 
     def test_too_short_returns_none(self):
         assert fallback_repr_from_raw(b"\x00" * 10, "float") is None
@@ -136,28 +136,20 @@ class TestFallbackInt312:
         return bytes(buf)
 
     def test_zero(self):
-        assert (
-            fallback_repr_from_raw(self._buf_with_tag(1), "int", self.PY) == "(freed) 0"
-        )
+        assert fallback_repr_from_raw(self._buf_with_tag(1), "int", self.PY) == "0"
 
     def test_compact_positive(self):
-        assert (
-            fallback_repr_from_raw(self._buf_with_tag(0, 42), "int", self.PY)
-            == "(freed) 42"
-        )
+        assert fallback_repr_from_raw(self._buf_with_tag(0, 42), "int", self.PY) == "42"
 
     def test_compact_negative(self):
         # lv_tag=2 → sign bit set
-        assert (
-            fallback_repr_from_raw(self._buf_with_tag(2, 7), "int", self.PY)
-            == "(freed) -7"
-        )
+        assert fallback_repr_from_raw(self._buf_with_tag(2, 7), "int", self.PY) == "-7"
 
     def test_multi_digit(self):
         # lv_tag=24 → ndigits = 24>>3 = 3
         assert (
             fallback_repr_from_raw(self._buf_with_tag(24), "int", self.PY)
-            == "(freed) int (3-digit)"
+            == "int (3-digit)"
         )
 
     def test_ndigits_too_large_returns_none(self):
@@ -184,27 +176,22 @@ class TestFallbackInt310:
         return bytes(buf)
 
     def test_zero(self):
-        assert (
-            fallback_repr_from_raw(self._buf_with_size(0), "int", self.PY)
-            == "(freed) 0"
-        )
+        assert fallback_repr_from_raw(self._buf_with_size(0), "int", self.PY) == "0"
 
     def test_single_digit_positive(self):
         assert (
-            fallback_repr_from_raw(self._buf_with_size(1, 99), "int", self.PY)
-            == "(freed) 99"
+            fallback_repr_from_raw(self._buf_with_size(1, 99), "int", self.PY) == "99"
         )
 
     def test_single_digit_negative(self):
         assert (
-            fallback_repr_from_raw(self._buf_with_size(-1, 99), "int", self.PY)
-            == "(freed) -99"
+            fallback_repr_from_raw(self._buf_with_size(-1, 99), "int", self.PY) == "-99"
         )
 
     def test_multi_digit(self):
         assert (
             fallback_repr_from_raw(self._buf_with_size(3), "int", self.PY)
-            == "(freed) int (3-digit)"
+            == "int (3-digit)"
         )
 
     def test_ndigits_too_large_returns_none(self):
@@ -226,9 +213,7 @@ class TestFallbackListTuple:
     def test_happy_path(self, type_name):
         buf = _buf(48)
         struct.pack_into("<q", buf, 32, 7)  # ob_size at GC_HEAD(16) + PyObject(16)
-        assert (
-            fallback_repr_from_raw(bytes(buf), type_name) == f"(freed) {type_name}[7]"
-        )
+        assert fallback_repr_from_raw(bytes(buf), type_name) == f"{type_name}[7]"
 
     @pytest.mark.parametrize("type_name", ["list", "tuple"])
     def test_too_short_returns_none(self, type_name):
@@ -249,7 +234,7 @@ class TestFallbackDict:
     def test_happy_path(self):
         buf = _buf(48)
         struct.pack_into("<q", buf, 32, 4)  # ma_used at GC_HEAD(16) + PyObject(16)
-        assert fallback_repr_from_raw(bytes(buf), "dict") == "(freed) dict{4}"
+        assert fallback_repr_from_raw(bytes(buf), "dict") == "dict{4}"
 
     def test_too_short_returns_none(self):
         assert fallback_repr_from_raw(b"\x00" * 10, "dict") is None
@@ -271,9 +256,7 @@ class TestFallbackSet:
         struct.pack_into(
             "<q", buf, 40, 3
         )  # used at GC_HEAD(16) + PyObject(16) + fill(8)
-        assert (
-            fallback_repr_from_raw(bytes(buf), type_name) == f"(freed) {type_name}{{3}}"
-        )
+        assert fallback_repr_from_raw(bytes(buf), type_name) == f"{type_name}{{3}}"
 
     @pytest.mark.parametrize("type_name", ["set", "frozenset"])
     def test_too_short_returns_none(self, type_name):
@@ -290,14 +273,14 @@ class TestFallbackSet:
 
 
 def test_frame_returns_fixed_string():
-    assert fallback_repr_from_raw(b"\x00" * 64, "frame") == "(freed frame)"
+    assert fallback_repr_from_raw(b"\x00" * 64, "frame") == "(frame)"
 
 
 # ── fallback_repr_from_raw: module + unknown ──────────────────────────────────
 
 
 def test_module_returns_fixed_string():
-    assert fallback_repr_from_raw(b"\x00" * 64, "module") == "(freed module)"
+    assert fallback_repr_from_raw(b"\x00" * 64, "module") == "(module)"
 
 
 def test_unknown_type_returns_none():
